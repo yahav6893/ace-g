@@ -1,0 +1,59 @@
+[project]
+name = "ace_g"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"
+description="Improve generalization of scene coordinate regression through query pre-training"
+readme = "README.md"
+dependencies = [
+    "dacite",
+    "einops",
+    "filelock",
+    "gdown",  # only for dataset setup
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "joblib",  # only for dataset setup
+    "Pillow",
+    "rerun-sdk==0.26.2",
+    "ruamel.yaml",
+    "scikit-image",
+    "timm==1.0.8",
+    "torchvision",
+    "torch>=2.7, <2.8",
+    "tqdm",
+    "xformers",
+    "yoco"
+]
+
+[tool.pyright]
+exclude = ["datasets/**", ".pixi/**"]
+useLibraryCodeForTypes = false
+typeCheckingMode = "basic"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "ANN", "D", "W", "PL"]
+ignore = ["ANN101", "D417", "PLR0913", "PLR0917", "PLR6104"]
+preview = true
+
+[tool.ruff.pydocstyle]
+convention = "google"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+ace_g = { path = ".", editable = true }
+dsacstar = { path = "./dsacstar" }
+
+[tool.pixi.tasks]
+example = "bash run_example.sh"
+
+[tool.pixi.dependencies]
+ruff = ">=0.14.0,<0.15"
+libopencv = ">=4.12,<5"
+opencv = ">=4.12,<5"
+pillow = "*"

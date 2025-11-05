@@ -1,0 +1,28 @@
+sst:
+  head: ace_g_pretrained.pt
+  encoder:
+    obj_type: ace_g.encoders.DINOv2Encoder
+    kwargs:
+      model_name: dinov2_vitl14_reg
+    path: null
+  num_iterations: 4000
+  max_dataset_passes: 40
+  max_buffer_size: 8000000
+  train_head: false
+  schedule_config:
+    learning_rate_div_factor: 5
+    learning_rate_final_div_factor: 1000
+    learning_rate_max: 0.002
+    optimizer: adamw
+    weight_decay: 0.01
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  num_map_embs: 4096
+  depth_target: 0.1
+  batch_size: 51200
+  samples_per_image: 1024
+reg:
+  uncertainty_filter: quantile
+  uncertainty_filter_quantile: 0.1
+  uncertainty_filter_quantile_factor: 2.0
+  threshold: 10

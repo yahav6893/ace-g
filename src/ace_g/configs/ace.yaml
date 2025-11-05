@@ -1,0 +1,11 @@
+sst:
+  num_iterations: 25000
+  train_head: True
+  head:
+    obj_type: ace_g.scr_heads.MLPHead
+  encoder:
+    path: ace_encoder_pretrained.pt
+  max_buffer_size: 8000000
+  schedule_config:
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
