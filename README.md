@@ -31,7 +31,7 @@ Then download our pre-trained model using
 wget https://storage.googleapis.com/niantic-lon-static/research/ace-g/ace_g_pretrained.pt
 ```
 
-## 1.1 - Setup datasets
+### 1.1 - Setup datasets
 The dataset setup is mainly automated. We provide setup scripts in the `datasets` directory for the following datasets: 7Scenes, 12Scenes, Cambridge, Indoor-6, and RIO-10. To setup a dataset, change to the `datasets` directory and run the setup script for the dataset of interest. For example, to setup the Indoor-6 dataset, run the following command:
 ```bash
 cd datasets
