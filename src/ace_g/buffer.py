@@ -47,7 +47,11 @@ class PatchBuffer:
     """Collection of tensors required for patch-based scene coordinate training."""
 
     features: torch.Tensor
-    """Batch of features sampled from images. Shape (B*num_samples_per_image, encoder.dim_out)."""
+    """Batch of features sampled from images.
+
+    Shape (B*num_samples_per_image, encoder.dim_out).
+    Note: encoder.dim_out may represent concatenated features from multiple encoders (e.g., MultiDinoEncoder).
+    """
     target_px: torch.Tensor
     """Pixel coordinate of original image corresponding to the center of the patch used to compute the feature.
     Shape (B*num_samples_per_image, 2)."""

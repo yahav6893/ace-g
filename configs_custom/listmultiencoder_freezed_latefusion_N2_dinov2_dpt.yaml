@@ -1,0 +1,65 @@
+sst:
+  output_dir: /content/drive/MyDrive/ace_g_outputs
+  num_iterations: 25000
+  train_head: true
+
+  # --- Late fusion head: 2 expert MLPHeads + gating weights ---
+  head:
+    obj_type: ace_g.scr_heads.LateFusionCoordHead
+    dim_in: 2048          # 2 * 1024 (ViT-L embed dim)
+    num_experts: 2
+
+    expert_head_paths:
+      - /content/drive/MyDrive/ace_g_outputs/DINOv2_vitl-aceg_cambridge-shopfacade_head.pt
+      - /content/drive/MyDrive/ace_g_outputs/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
+    freeze_loaded_experts: true
+    force_shared_mean: true   # recommended unless you verified both heads have identical mean
+
+    gate_input: concat      # "main" uses expert[main_index] features, "concat" uses all features
+    main_index: 0
+    weights_per_patch: true
+    gate_hidden_ratio: 1.0
+    gate_dropout: 0.1
+    temperature: 1.0
+
+    # Expert head template (replicated 3x inside LateFusionCoordHead)
+    expert_head:
+      obj_type: ace_g.scr_heads.MLPHead
+      dim_in: 1024
+      num_blocks: 1
+      use_homogeneous: true
+      homogeneous_min_scale: 0.01
+      homogeneous_max_scale: 4.0
+      use_uncertainty: false
+
+    use_homogeneous: true
+    homogeneous_min_scale: 0.01
+    homogeneous_max_scale: 4.0
+    use_uncertainty: false
+
+  # --- Encoder: ONE list (vanilla DINOv2, DPTv2) ---
+  encoder:
+    obj_type: ace_g.encoders.ListMultiEncoder
+    kwargs:
+      encoders:
+        - obj_type: ace_g.encoders.DINOv2Encoder
+          kwargs:
+            model_name: dinov2_vitl14
+          path: null
+
+        - obj_type: ace_g.encoders.DPTv2Encoder
+          kwargs:
+            model_name: vitl
+            checkpoint: /content/drive/MyDrive/ace_cache/depth_anything/depth_anything_v2_vitl.pth
+          path: null
+    path: null
+
+  # --- ACE-G 5min defaults ---
+  max_buffer_size: 4_000_000
+  schedule_config:
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true

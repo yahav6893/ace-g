@@ -1,0 +1,31 @@
+sst:
+  output_dir: /content/drive/MyDrive/ace_g_outputs
+  iterations: 25000
+  train_head: true
+
+  # --- Simple single-head baseline ---
+  head:
+    obj_type: ace_g.scr_heads.MLPHead
+    dim_in: 1024
+    num_blocks: 1
+    use_homogeneous: true
+    homogeneous_min_scale: 0.01
+    homogeneous_max_scale: 4.0
+    use_uncertainty: false
+
+  # --- Single encoder: vanilla DINOv2 ViT-L/14 ---
+  encoder:
+    obj_type: ace_g.encoders.DINOv2Encoder
+    kwargs:
+      model_name: dinov2_vitl14
+    path: null
+
+  # --- ACE-G 5min defaults ---
+  max_buffer_size: 4_000_000
+  schedule_config:
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true

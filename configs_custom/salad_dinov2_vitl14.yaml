@@ -1,0 +1,20 @@
+sst:
+  output_dir: /content/drive/MyDrive/ace_g_outputs
+  iterations: 25000
+  train_head: True
+  head:
+    obj_type: ace_g.scr_heads.MLPHead
+    dim_in: 1024
+  encoder:
+    obj_type: ace_g.encoders.SALADEncoder
+    kwargs:
+      model_name: dinov2_vitl14
+      checkpoint: null
+      checkpoint_url: "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt"
+  max_buffer_size: 4_000_000
+  schedule_config:
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: True
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
