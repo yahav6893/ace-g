@@ -1,12 +1,17 @@
 # model files
 *.pt
 
+# cache
+cache/
+
 # outputs
 outputs/
+wandb/
 
 # datasets
 datasets/rio10
 datasets/indoor6
+datasets/cambridge
 
 # pixi environments
 .pixi/*
