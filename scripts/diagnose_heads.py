@@ -42,11 +42,54 @@ def ensure_ace_g_importable(repo_root: str | Path) -> None:
         sys.path.insert(0, str(src))
 
 
+def setup_wandb_logging(args: argparse.Namespace, job_type: str):
+    if not getattr(args, "wandb_log", False):
+        return None
+    import wandb
+
+    project = getattr(args, "wandb_project", None)
+    entity = getattr(args, "wandb_entity", None)
+
+    # Try to infer entity/project from head_path if not provided
+    head_path = getattr(args, "head_path", "")
+    if str(head_path).startswith("wandb://") and not (project and entity):
+        art_path = str(head_path)[len("wandb://"):]
+        parts = art_path.split("/")
+        if len(parts) >= 3:
+            entity = entity or parts[0]
+            project = project or parts[1]
+
+    run = wandb.init(project=project, entity=entity, job_type=job_type)
+    
+    if str(head_path).startswith("wandb://"):
+        art_path = str(head_path)[len("wandb://"):]
+        run.use_artifact(art_path)
+    return run
+
+
 def load_head(repo_root: str | Path, head_path: str | Path):
     ensure_ace_g_importable(repo_root)
     from ace_g import scr_heads  # type: ignore
 
-    p = expand(head_path)
+    head_path_str = str(head_path)
+    if head_path_str.startswith("wandb://"):
+        import wandb
+        artifact_path = head_path_str[len("wandb://"):]
+        print(f"Downloading wandb artifact: {artifact_path} ...")
+        api = wandb.Api()
+        try:
+            artifact = api.artifact(artifact_path)
+            download_dir = artifact.download()
+            pt_files = list(Path(download_dir).glob("*.pt"))
+            if not pt_files:
+                raise ScriptError(f"No .pt file found in artifact {artifact_path}")
+            p = pt_files[0]
+            print(f"Using downloaded artifact head: {p}")
+        except Exception as e:
+            raise ScriptError(f"Error fetching wandb artifact: {e}")
+    else:
+        p = expand(head_path)
+
     if not p.is_file():
         raise ScriptError(f"Missing head checkpoint: {p}")
     return scr_heads.create_head(p)
@@ -221,6 +264,11 @@ def extract_softmax_weights(head, patch_embeddings: torch.Tensor) -> torch.Tenso
 def cmd_gate_weights(args: argparse.Namespace) -> int:
     print_stage_header("GATE WEIGHTS")
     ensure_ace_g_importable(args.repo_root)
+    run = setup_wandb_logging(args, "gate-weights")
+    if run:
+        import wandb
+        table = wandb.Table(columns=["image", "expert_idx", "mean", "min", "max", "win_pct"])
+
     cfg_path = expand(args.config_path)
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     encs = build_encoders_from_cfg(cfg)
@@ -235,6 +283,7 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
 
     paths = sorted(glob.glob(args.rgb_glob))[: args.num_images]
     if not paths:
+        if run: run.finish(exit_code=1)
         raise ScriptError(f"No images matched: {args.rgb_glob}")
 
     print(f"config_path: {cfg_path}")
@@ -246,6 +295,7 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
 
     with torch.no_grad():
         for p in paths:
+            img_name = Path(p).name
             x = load_img_tensor(p, args.max_side).to(device)
             with torch.autocast("cuda", enabled=use_half):
                 feats = run_concat_features(encs, x)
@@ -257,23 +307,34 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
             mx = w.amax(dim=(1, 2)).detach().float().cpu().numpy()
             winner = w.argmax(dim=0).detach().cpu().numpy()
             win_frac = np.bincount(winner.reshape(-1), minlength=k) / winner.size
-            print(f"\n--- {Path(p).name} ---")
+            print(f"\n--- {img_name} ---")
             for idx in range(k):
                 print(
                     f"expert[{idx}] mean={mean[idx]:.4f} min={mn[idx]:.4f} "
                     f"max={mx[idx]:.4f} win%={100 * win_frac[idx]:.1f}"
                 )
+                if run:
+                    table.add_data(img_name, idx, float(mean[idx]), float(mn[idx]), float(mx[idx]), float(100 * win_frac[idx]))
+    
+    if run:
+        run.log({"gate_weights_distribution": table})
+        run.finish()
+        
     print("\nDone.")
     return 0
 
 
 def cmd_gate_last_layer(args: argparse.Namespace) -> int:
     print_stage_header("GATE LAST LAYER")
+    run = setup_wandb_logging(args, "gate-last-layer")
+
     head = load_head(args.repo_root, args.head_path).cpu().eval()
     if not hasattr(head, "gate"):
+        if run: run.finish(exit_code=1)
         raise ScriptError("Loaded head has no .gate attribute")
     last = head.gate[-1]
     if not isinstance(last, torch.nn.Conv2d):
+        if run: run.finish(exit_code=1)
         raise ScriptError(f"Expected head.gate[-1] to be Conv2d, got {type(last)}")
 
     bias = last.bias.detach().cpu().numpy() if last.bias is not None else None
@@ -288,6 +349,9 @@ def cmd_gate_last_layer(args: argparse.Namespace) -> int:
         "bias_only_softmax": torch.softmax(last.bias.detach().cpu(), dim=0).numpy().tolist() if last.bias is not None else None,
     }
     print(json.dumps(out, indent=2))
+    
+    if run:
+        run.config.update({"gate_last_layer_stats": out})
 
     if args.probe_config_path and args.probe_rgb_glob:
         ensure_ace_g_importable(args.repo_root)
@@ -301,6 +365,7 @@ def cmd_gate_last_layer(args: argparse.Namespace) -> int:
 
         images = sorted(glob.glob(args.probe_rgb_glob))[:1]
         if not images:
+            if run: run.finish(exit_code=1)
             raise ScriptError(f"No images matched probe glob: {args.probe_rgb_glob}")
         x = load_img_tensor(images[0], args.max_side).to(device)
 
@@ -320,6 +385,7 @@ def cmd_gate_last_layer(args: argparse.Namespace) -> int:
         h = captured.get("pre_last")
         logits = captured.get("logits")
         if h is None or logits is None:
+            if run: run.finish(exit_code=1)
             raise ScriptError("Failed to capture last-layer input/logits during probe")
 
         w = last.weight.detach().cpu()
@@ -340,6 +406,13 @@ def cmd_gate_last_layer(args: argparse.Namespace) -> int:
         }
         print("\nPROBE_STATS")
         print(json.dumps(probe_stats, indent=2))
+        
+        if run:
+            run.log({"probe_stats": probe_stats})
+            
+    if run:
+        run.finish()
+        
     return 0
 
 
@@ -361,6 +434,9 @@ def cmd_print_config(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--repo-root", default="~/dace/ace-g", help="ACE-G repo root")
+    p.add_argument("--wandb-log", action="store_true", help="Log diagnostic results to W&B")
+    p.add_argument("--wandb-project", default=None, help="W&B project")
+    p.add_argument("--wandb-entity", default=None, help="W&B entity")
 
     sp = p.add_subparsers(dest="cmd", required=True)
 
