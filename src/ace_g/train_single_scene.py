@@ -161,11 +161,22 @@ class SingleSceneTrainer:
         _logger.info(f"Using device for training: {self.config.device}")
         _logger.info(f"ACE feature buffer device: {self.config.buffer_device}")
 
-        # The flag below controls whether to allow TF32 on matmul. This flag defaults to True.
-        # torch.backends.cuda.matmul.allow_tf32 = False
+        # The flag below controls whether to allow TF32 on matmul. This flag defaults to False
+        # in PyTorch 1.12 and later.
+        torch.backends.cuda.matmul.allow_tf32 = False
 
         # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
-        # torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.enabled = False
+
+        if "WANDB_RUN_ID" in os.environ and "WANDB_PROJECT" in os.environ:
+            import wandb
+            # In a subprocess, wandb init with resume="allow" automatically merges perfectly into the active run 
+            # or tracks seamlessly alongside it.
+            wandb.init(resume="allow")
+            self._use_wandb = True
+        else:
+            self._use_wandb = False
 
         # Setup randomness for reproducibility.
         _logger.info(f"Setting random seed to {self.config.base_seed}")
@@ -245,9 +256,17 @@ class SingleSceneTrainer:
         # Create iterable of trained parameters
         trained_parameters = []
         if self.config.train_head:
-            trained_parameters.extend(self.regressor.head.parameters())
+            if hasattr(self.regressor.head, 'get_param_groups'):
+                trained_parameters.extend(
+                    self.regressor.head.get_param_groups(
+                        min_lr=self.config.schedule_config.learning_rate_min,
+                        max_lr=self.config.schedule_config.learning_rate_max
+                    )
+                )
+            else:
+                trained_parameters.append({"params": list(self.regressor.head.parameters()), "name": "head"})
         if self.config.train_map_embs and self.map_embeddings is not None:
-            trained_parameters.append(self.map_embeddings)
+            trained_parameters.append({"params": [self.map_embeddings], "name": "map_embeddings"})
 
         self.regressor.train()
 
@@ -442,6 +461,9 @@ class SingleSceneTrainer:
         # check whether to start cooldown
         self.training_scheduler.check_and_set_cooldown(self.iteration)
 
+        if hasattr(self.regressor.head, 'unfreeze_experts_if_needed'):
+            self.regressor.head.unfreeze_experts_if_needed(self.iteration)
+
         # check whether training has finished, number of total iterations might have been reduced
         if self.iteration >= self.training_scheduler.max_iterations:
             return
@@ -514,6 +536,24 @@ class SingleSceneTrainer:
         )
 
         losses.log_metrics(loss, losses_3d, losses_2d, dists_3d, dists_2d)
+
+        if hasattr(self.regressor.head, 'last_l2_reg_loss') and self.regressor.head.last_l2_reg_loss is not None:
+            loss = loss + self.regressor.head.last_l2_reg_loss
+            if self.config.use_rerun:
+                rr.log("loss_l2_reg", rr.Scalars(self.regressor.head.last_l2_reg_loss.item()))
+
+        if getattr(self, '_use_wandb', False):
+            import wandb
+            wb_log_dict = {}
+            if hasattr(self.regressor.head, 'last_l2_reg_loss') and self.regressor.head.last_l2_reg_loss is not None:
+                wb_log_dict["train/loss_l2_reg"] = self.regressor.head.last_l2_reg_loss.item()
+            
+            for i, pg in enumerate(self.training_scheduler.optimizer.param_groups):
+                name = pg.get("name", f"group_{i}")
+                wb_log_dict[f"train/lr_{name}"] = pg["lr"]
+                
+            if wb_log_dict:
+                wandb.log(wb_log_dict, commit=False)
 
         if torch.any(torch.isnan(loss)):
             _logger.info("nan loss detected (step skipped)")

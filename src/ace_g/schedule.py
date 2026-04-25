@@ -69,6 +69,17 @@ class ScheduleACE:
 
         self.max_iterations = num_iterations
 
+        is_param_groups = isinstance(parameters, list) and len(parameters) > 0 and isinstance(parameters[0], dict)
+        if is_param_groups:
+            max_lrs = [g.get('max_lr', self.config.learning_rate_max) for g in parameters]
+            min_lrs = [g.get('min_lr', self.config.learning_rate_min) for g in parameters]
+            for g, max_lr in zip(parameters, max_lrs):
+                if 'lr' not in g:
+                    g['lr'] = max_lr
+        else:
+            max_lrs = self.config.learning_rate_max
+            min_lrs = self.config.learning_rate_min
+
         # Setup learning rate scheduler
         if self.config.learning_rate_schedule == "constant":
             self.optimizer = optimizer_cls(parameters, lr=self.config.learning_rate_min)
@@ -127,8 +138,8 @@ class ScheduleACE:
             self.optimizer = optimizer_cls(parameters, lr=self.config.learning_rate_max)
             self.scheduler = optim.lr_scheduler.CyclicLR(
                 self.optimizer,
-                base_lr=self.config.learning_rate_min,
-                max_lr=self.config.learning_rate_max,
+                base_lr=min_lrs,
+                max_lr=max_lrs,
                 step_size_up=1000,
                 step_size_down=1000,
                 cycle_momentum=False,
@@ -140,7 +151,7 @@ class ScheduleACE:
             self.optimizer = optimizer_cls(parameters, lr=self.config.learning_rate_min)
             self.scheduler = optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
-                max_lr=self.config.learning_rate_max,
+                max_lr=max_lrs,
                 total_steps=self.max_iterations,
                 cycle_momentum=False,
                 div_factor=self.config.learning_rate_div_factor,

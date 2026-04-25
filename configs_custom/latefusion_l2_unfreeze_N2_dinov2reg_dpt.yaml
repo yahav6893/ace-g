@@ -10,10 +10,15 @@ sst:
     num_experts: 2
 
     expert_head_paths:
-      - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-kingscollege_head.pt
-      - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-kingscollege_head.pt
+      - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
+      - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
     freeze_loaded_experts: true
     force_shared_mean: true   # recommended unless you verified both heads have identical mean
+    
+    l2_reg_weight: 10.0
+    unfreeze_experts_after_iterations: 1
+    gate_learning_rate_factor: 1.0
+    expert_learning_rate_factor: 0.1
 
     gate_input: concat      # "main" uses expert[main_index] features, "concat" uses all features
     main_index: 0

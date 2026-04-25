@@ -539,6 +539,12 @@ class LateFusionCoordHead(SCRHead):
         freeze_loaded_experts: bool = True
         force_shared_mean: bool = True   # make all loaded experts share expert[0].mean (safety)
 
+        # New hyperparameters
+        l2_reg_weight: float = 0.0
+        unfreeze_experts_after_iterations: int = -1
+        gate_learning_rate_factor: float = 1.0
+        expert_learning_rate_factor: float = 1.0
+
         # Gating
         gate_input: Literal["main", "concat"] = "concat"
         main_index: int = 0
@@ -718,7 +724,57 @@ class LateFusionCoordHead(SCRHead):
         if u_hat is not None:
             u_hat = u_hat.view(*leading_dims, 1, h, w)
 
+        if getattr(self.config, 'l2_reg_weight', 0.0) > 0.0:
+            self.last_l2_reg_loss = (logits ** 2).mean() * self.config.l2_reg_weight
+        else:
+            self.last_l2_reg_loss = None
+
         return y_hat, u_hat
+
+    def unfreeze_experts_if_needed(self, iteration: int):
+        target_iter = getattr(self.config, 'unfreeze_experts_after_iterations', -1)
+        if target_iter > 0 and iteration == target_iter:
+            _logger.info(f"Unfreezing expert heads at iteration {iteration}")
+            for prm in self.expert_heads.parameters():
+                prm.requires_grad_(True)
+
+    def get_param_groups(self, min_lr: float, max_lr: float) -> list[dict]:
+        gate_factor = getattr(self.config, 'gate_learning_rate_factor', 1.0)
+        expert_factor = getattr(self.config, 'expert_learning_rate_factor', 1.0)
+
+        groups = []
+        gate_params = list(self.gate.parameters())
+        if gate_params:
+            groups.append({
+                "name": "gate",
+                "params": gate_params,
+                "lr": max_lr * gate_factor,
+                "max_lr": max_lr * gate_factor,
+                "min_lr": min_lr * gate_factor,
+            })
+
+        expert_params = list(self.expert_heads.parameters())
+        if expert_params:
+            groups.append({
+                "name": "experts",
+                "params": expert_params,
+                "lr": max_lr * expert_factor,
+                "max_lr": max_lr * expert_factor,
+                "min_lr": min_lr * expert_factor,
+            })
+
+        handled = set(id(p) for p in gate_params + expert_params)
+        other_params = [p for p in self.parameters() if id(p) not in handled]
+        if other_params:
+            groups.append({
+                "name": "other",
+                "params": other_params,
+                "lr": max_lr,
+                "max_lr": max_lr,
+                "min_lr": min_lr,
+            })
+            
+        return groups
 
 # HeadConfig = MLPHead.Config | TransformerHead.Config | FusionHead.Config | pathlib.Path
 HeadConfig = MLPHead.Config | TransformerHead.Config | FusionHead.Config | LateFusionCoordHead.Config | pathlib.Path

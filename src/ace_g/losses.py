@@ -291,7 +291,7 @@ def log_metrics(
             if torch.isfinite(inlier_ratio):
                 rr.log(f"inliers_{inlier_threshold}cm", rr.Scalars(inlier_ratio.item()))
 
-    if distances_2d is not None:
+    if losses_2d is not None:
         inlier_thresholds_2d = [5, 10, 20]  # px
         for inlier_threshold in inlier_thresholds_2d:
             inliers = distances_2d < inlier_threshold
@@ -306,6 +306,21 @@ def log_metrics(
             rr.log(f"quantile_2d_{quantile:.1f}", rr.Scalars(quantile_value))
 
         rr.log("mean_distance_2d", rr.Scalars(distances_2d.mean().item()))
+
+    try:
+        import wandb
+        if getattr(wandb, "run", None) is not None:
+            wb_logs = {}
+            if loss is not None:
+                wb_logs["train/loss_total"] = loss.item()
+            if losses_3d is not None and torch.isfinite(losses_3d.mean()):
+                wb_logs["train/loss_3d"] = losses_3d.mean().item()
+            if losses_2d is not None:
+                wb_logs["train/loss_2d"] = losses_2d.mean().item()
+            if wb_logs:
+                wandb.log(wb_logs, commit=True)
+    except ImportError:
+        pass
 
 
 def weighted_tanh(repro_errs: torch.Tensor, weight: float) -> torch.Tensor:

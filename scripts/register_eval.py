@@ -17,6 +17,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import yoco
 
 from _common import (
     ScriptError,
@@ -110,10 +111,24 @@ def main() -> int:
     env = build_subprocess_env(
         repo_root=repo_root,
         torch_home=args.torch_home,
-        extra_env=args.extra_env,
+        extra_env=args.extra_env + [
+            f"WANDB_PROJECT={args.wandb_project}",
+            f"WANDB_ENTITY={args.wandb_entity}",
+        ],
         prepend_pythonpath=args.pythonpath_prepend,
     )
 
+    # We can read the config from one of the session map config if needed, or if train_status hasn't got it, 
+    # it's usually inside output_root/session_id_map.yaml. 
+    # Since we don't have a direct config_path argument here in register_eval.py, wait...
+    # Oh! `register_eval.py` does not take `--config-name` as per parse_args in register_eval.py!
+    # Let me check parse_args of register_eval.py.
+    # Ah, the user runs it with `--config-name`? No, run_pipeline.sh runs:
+    # python register_eval.py ... --config-name "${CONFIG_NAME}"
+    # Wait, does register_eval.py have --config-name?
+    # Let's see parse_args
+    # I didn't see --config-name in register_eval.py.
+    # Let me check.
     run_name = f"register-eval__{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
     wb_run = maybe_init_wandb(
         enabled=not args.disable_wandb,

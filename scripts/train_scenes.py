@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import yoco
 
 from _common import (
     ScriptError,
@@ -104,9 +105,14 @@ def main() -> int:
     env = build_subprocess_env(
         repo_root=repo_root,
         torch_home=args.torch_home,
-        extra_env=args.extra_env,
+        extra_env=args.extra_env + [
+            f"WANDB_PROJECT={args.wandb_project}",
+            f"WANDB_ENTITY={args.wandb_entity}",
+        ],
         prepend_pythonpath=args.pythonpath_prepend,
     )
+
+    config_dict = yoco.load_config_from_file(config_path)
 
     run_name = f"train__{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
     wb_run = maybe_init_wandb(
@@ -127,13 +133,43 @@ def main() -> int:
             "model_name": model_name,
             "dataset_name": dataset_name,
             "scenes": scenes,
+            **config_dict,
         },
     )
+
+    def _find_expert_heads(cfg):
+        if isinstance(cfg, dict):
+            if "expert_head_paths" in cfg:
+                return cfg["expert_head_paths"]
+            for v in cfg.values():
+                res = _find_expert_heads(v)
+                if res: return res
+        elif isinstance(cfg, list):
+            for item in cfg:
+                res = _find_expert_heads(item)
+                if res: return res
+        return []
+
+    expert_paths = _find_expert_heads(config_dict)
 
     rows: list[dict] = []
     status_payload: dict[str, dict] = {}
 
     for idx, scene in enumerate(scenes, start=1):
+        if expert_paths:
+            for ep in expert_paths:
+                if not ep:
+                    continue
+                ep_stem = Path(ep).name
+                if ep_stem.endswith(".pt"):
+                    ep_stem = ep_stem[:-3]
+                elif ep_stem.endswith(".p"):
+                    ep_stem = ep_stem[:-2]
+                if ep_stem.endswith("_head"):
+                    ep_stem = ep_stem[:-5]
+                if not (ep_stem.endswith(f"_{scene}") or ep_stem.endswith(f"-{scene}")):
+                    raise ScriptError(f"Sanity check failed: --scene '{scene}' does not match expert_head_path '{ep}'")
+
         split = scene_split_paths(dataset_root, scene, "train")
         base_session = f"{model_name}-{dataset_name}-{scene}"
         session_id = f"{args.session_prefix}-{base_session}" if args.session_prefix else base_session

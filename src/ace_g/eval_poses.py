@@ -263,6 +263,13 @@ def eval_poses(
     output_file = config.output_dir / f"{session_id}_eval.yaml"
     utils.save_yaml(utils.primitive(out_dict), output_file)
 
+    import os
+    if "WANDB_RUN_ID" in os.environ and "WANDB_PROJECT" in os.environ:
+        import wandb
+        if getattr(wandb, "run", None) is None:
+            wandb.init(resume="allow")
+        wandb.log({f"eval/{k}": v for k, v in metric_dict.items()})
+
     return metric_dict, out_dict
 
 
