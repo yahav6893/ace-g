@@ -552,7 +552,7 @@ class SingleSceneTrainer:
                     "Use UncExpertFusionHead or disable mogu_loss_weight."
                 )
 
-            loss_mogu = self.regressor.head.compute_mogu_loss(target_scene_coords)
+            loss_mogu = self.regressor.head.compute_mogu_loss(target_coords_b3)
 
             loss = loss + mogu_loss_weight * loss_mogu
 
