@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="${HOME}/dace/ace-g"
 DATASET_ROOT="${HOME}/dace/datasets/cambridge"
-CONFIG_NAME="latefusion_l2_unfreeze_N2_dinov2reg_dpt.yaml"
+CONFIG_NAME="MoGU_N2_dinov2reg_dpt.yaml"
 SCENES="shopfacade"
 OUTPUT_ROOT="${HOME}/dace/outputs"
 CACHE_ROOT="${HOME}/dace/cache"

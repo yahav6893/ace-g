@@ -542,6 +542,23 @@ class SingleSceneTrainer:
             if self.config.use_rerun:
                 rr.log("loss_l2_reg", rr.Scalars(self.regressor.head.last_l2_reg_loss.item()))
 
+        head_cfg = getattr(self.regressor.head, "config", None)
+        mogu_loss_weight = float(getattr(head_cfg, "mogu_loss_weight", 0.0))
+
+        if mogu_loss_weight > 0.0:
+            if not hasattr(self.regressor.head, "compute_mogu_loss"):
+                raise RuntimeError(
+                    "mogu_loss_weight > 0, but head has no compute_mogu_loss(). "
+                    "Use UncExpertFusionHead or disable mogu_loss_weight."
+                )
+
+            loss_mogu = self.regressor.head.compute_mogu_loss(target_scene_coords)
+
+            loss = loss + mogu_loss_weight * loss_mogu
+
+            rr.log("loss_mogu", rr.Scalars(loss_mogu.item()))
+            rr.log("loss_mogu_weighted", rr.Scalars((mogu_loss_weight * loss_mogu).item()))            
+
         if getattr(self, '_use_wandb', False):
             import wandb
             wb_log_dict = {}

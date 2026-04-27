@@ -509,6 +509,7 @@ class FusionHead(SCRHead):
 
         return self.mlp_head(fused)
 
+
 class LateFusionCoordHead(SCRHead):
     """Late fusion in target (coordinates) domain with optional pretrained expert heads.
 
@@ -776,8 +777,497 @@ class LateFusionCoordHead(SCRHead):
             
         return groups
 
+
+class UncHead(nn.Module):
+    """Uncertainty head for one SCR expert.
+
+    Input:
+        x: [B, C, h, w]
+
+    Output:
+        sq_sigma: [B, out_dim, h, w]
+
+    sq_sigma is variance, not std.
+    """
+
+    @dataclasses.dataclass(kw_only=True)
+    class Config:
+        dim_in: int
+        out_dim: int = 3
+        arc_type: Literal["linear", "mlp"] = "mlp"
+        hidden_ratio: float = 1.0
+        head_dropout: float = 0.0
+        var_eps: float = 1e-6
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+
+        c = int(config.dim_in)
+        out_dim = int(config.out_dim)
+
+        if config.arc_type == "linear":
+            self.head = nn.Conv2d(c, out_dim, kernel_size=1, bias=True)
+
+        elif config.arc_type == "mlp":
+            hidden = max(1, int(c * float(config.hidden_ratio)))
+            self.head = nn.Sequential(
+                nn.Conv2d(c, hidden, kernel_size=1, bias=True),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=float(config.head_dropout)),
+                nn.Conv2d(hidden, out_dim, kernel_size=1, bias=True),
+            )
+
+        else:
+            raise ValueError(f"Unsupported UncHead arc_type={config.arc_type}")
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"UncHead expected [B,C,h,w], got {tuple(x.shape)}")
+
+        raw_sigma = self.head(x)
+
+        sq_sigma = F.softplus(raw_sigma, threshold=5.0) + float(self.config.var_eps)
+
+        return sq_sigma
+
+class UncExpertHead(nn.Module):
+    """One uncertainty-aware SCR expert.
+
+    Contains:
+        - one MLPHead for coordinate prediction
+        - one UncHead for variance prediction
+
+    Forward:
+        x -> y_pred, sq_sigma
+    """
+
+    def __init__(
+        self,
+        mlp_head: MLPHead,
+        unc_head: UncHead,
+    ) -> None:
+        super().__init__()
+
+        self.mlp_head = mlp_head
+        self.unc_head = unc_head
+
+    def forward(self, x: torch.Tensor):
+        # MLPHead already returns (coords, uncertainty_or_none)
+        y_pred, _ = self.mlp_head(x)
+
+        sq_sigma = self.unc_head(x)
+
+        if y_pred.shape != sq_sigma.shape:
+            raise RuntimeError(
+                "UncExpertHead: y_pred and sq_sigma must have the same shape. "
+                f"got y_pred={tuple(y_pred.shape)}, sq_sigma={tuple(sq_sigma.shape)}"
+            )
+
+        return y_pred, sq_sigma
+
+
+class UncExpertFusionHead(SCRHead):
+    """Uncertainty-based expert fusion head.
+
+    Similar to LateFusionCoordHead, but instead of a learned gate, this head
+    uses the predicted variance from each expert to compute MoE weights.
+
+    Input:
+        patch_embeddings: (..., K*C, h, w)
+
+    Output:
+        y_hat:
+            (..., 3, h, w)
+
+        u_hat:
+            optional fused uncertainty for compatibility.
+            The full per-expert uncertainty needed for MoGU loss is stored in:
+                self.last_sq_sigmas
+                self.last_moe_weights
+                self.last_expert_preds
+    """
+
+    @dataclasses.dataclass(kw_only=True)
+    class Config:
+        obj_type: Literal["ace_g.scr_heads.UncExpertFusionHead"] = (
+            "ace_g.scr_heads.UncExpertFusionHead"
+        )
+
+        dim_in: int | None = None
+
+        # Experts
+        num_experts: int
+        expert_heads: list[MLPHead.Config] | None = None
+        expert_head: MLPHead.Config | None = None
+
+        # Optional pretrained expert loading
+        expert_head_paths: list[pathlib.Path | None] | None = None
+        freeze_loaded_experts: bool = True
+        force_shared_mean: bool = True
+
+        # Uncertainty head
+        unc_head: UncHead.Config | None = None
+        unc_heads: list[UncHead.Config] | None = None
+
+        # MoE uncertainty gating
+        eps: float = 1e-8
+        mogu_loss_weight: float = 1.0
+
+        # Whether to return a fused one-channel uncertainty as u_hat
+        return_fused_uncertainty: bool = False
+
+        # SCRHead base knobs
+        mean: torch.Tensor | None = None
+        use_homogeneous: bool = True
+        homogeneous_min_scale: float = 0.01
+        homogeneous_max_scale: float = 4.0
+        use_uncertainty: bool = False
+
+    dim_map_emb = None
+
+    @config_to_state_dict
+    def __init__(self, config: Config) -> None:
+        self.config = config
+
+        assert self.config.dim_in is not None, "dim_in must be set."
+        assert self.config.num_experts >= 1
+        assert self.config.dim_in % self.config.num_experts == 0, (
+            "dim_in must be divisible by num_experts."
+        )
+
+        self.c = self.config.dim_in // self.config.num_experts
+
+        super().__init__(
+            mean=self.config.mean,
+            use_homogeneous=self.config.use_homogeneous,
+            homogeneous_min_scale=self.config.homogeneous_min_scale,
+            homogeneous_max_scale=self.config.homogeneous_max_scale,
+            use_uncertainty=self.config.use_uncertainty,
+        )
+
+        k = self.config.num_experts
+
+        # -------------------------------------------------
+        # Build K MLPHead configs
+        # -------------------------------------------------
+        if self.config.expert_heads is not None:
+            assert len(self.config.expert_heads) == k, (
+                "expert_heads length must equal num_experts"
+            )
+            mlp_cfgs = self.config.expert_heads
+        else:
+            template = self.config.expert_head
+
+            if template is None:
+                template = MLPHead.Config(
+                    dim_in=self.c,
+                    num_blocks=1,
+                    mean=self.config.mean,
+                    use_homogeneous=self.config.use_homogeneous,
+                    homogeneous_min_scale=self.config.homogeneous_min_scale,
+                    homogeneous_max_scale=self.config.homogeneous_max_scale,
+                    use_uncertainty=False,
+                )
+
+            mlp_cfgs = [
+                dataclasses.replace(template, dim_in=self.c, use_uncertainty=False)
+                for _ in range(k)
+            ]
+
+        # -------------------------------------------------
+        # Build K UncHead configs
+        # -------------------------------------------------
+        if self.config.unc_heads is not None:
+            assert len(self.config.unc_heads) == k, (
+                "unc_heads length must equal num_experts"
+            )
+            unc_cfgs = self.config.unc_heads
+        else:
+            template_unc = self.config.unc_head
+
+            if template_unc is None:
+                template_unc = UncHead.Config(
+                    dim_in=self.c,
+                    out_dim=3,
+                    arc_type="mlp",
+                    hidden_ratio=1.0,
+                    head_dropout=0.0,
+                    var_eps=1e-6,
+                )
+
+            unc_cfgs = [
+                dataclasses.replace(template_unc, dim_in=self.c, out_dim=3)
+                for _ in range(k)
+            ]
+
+        # -------------------------------------------------
+        # Build K uncertainty-aware experts
+        # -------------------------------------------------
+        self.experts = nn.ModuleList()
+
+        for i in range(k):
+            mlp_head = MLPHead(mlp_cfgs[i])
+            unc_head = UncHead(unc_cfgs[i])
+
+            self.experts.append(
+                UncExpertHead(
+                    mlp_head=mlp_head,
+                    unc_head=unc_head,
+                )
+            )
+
+        # -------------------------------------------------
+        # Optional: load pretrained MLPHead weights
+        # -------------------------------------------------
+        if self.config.expert_head_paths is not None:
+            paths = list(self.config.expert_head_paths)
+
+            assert len(paths) == k, (
+                "expert_head_paths must have length == num_experts "
+                "(use None for missing entries)."
+            )
+
+            for i, p in enumerate(paths):
+                if p is None:
+                    continue
+
+                p = pathlib.Path(p)
+
+                if not p.exists():
+                    raise FileNotFoundError(
+                        f"expert_head_paths[{i}] does not exist: {p}"
+                    )
+
+                loaded = create_head(p)
+
+                if not isinstance(loaded, MLPHead):
+                    raise TypeError(
+                        f"expert_head_paths[{i}] must point to an MLPHead checkpoint, "
+                        f"got {type(loaded)}"
+                    )
+
+                if getattr(loaded.config, "dim_in", None) is not None:
+                    if loaded.config.dim_in != self.c:
+                        raise ValueError(
+                            f"Loaded expert[{i}] dim_in={loaded.config.dim_in}, "
+                            f"but expected {self.c} "
+                            f"(dim_in={self.config.dim_in}, num_experts={k})."
+                        )
+
+                # Replace only the MLPHead.
+                # The UncHead remains newly initialized and trainable.
+                self.experts[i].mlp_head = loaded
+
+                if self.config.freeze_loaded_experts:
+                    for prm in self.experts[i].mlp_head.parameters():
+                        prm.requires_grad_(False)
+
+            # Optional safety: force shared mean across loaded experts
+            if self.config.force_shared_mean and len(self.experts) >= 2:
+                ref = self.experts[0].mlp_head.mean.detach().clone()
+
+                for i in range(1, k):
+                    cur = self.experts[i].mlp_head.mean
+
+                    if not torch.allclose(cur, ref, atol=1e-6, rtol=0.0):
+                        _logger.warning(
+                            f"UncExpertFusionHead: expert[{i}] mean differs from "
+                            "expert[0]; forcing expert[i].mean = expert[0].mean."
+                        )
+                        self.experts[i].mlp_head.mean.copy_(ref)
+
+        self.last_expert_preds = None
+        self.last_sq_sigmas = None
+        self.last_moe_weights = None
+        self.last_mogu_loss = None
+
+    def forward(self, patch_embeddings: torch.Tensor):
+        leading_dims = patch_embeddings.shape[:-3]
+        dim_in, h, w = patch_embeddings.shape[-3:]
+
+        x = patch_embeddings.view(-1, dim_in, h, w)
+        b = x.shape[0]
+
+        k = self.config.num_experts
+        c = self.c
+
+        if dim_in != k * c:
+            raise ValueError(
+                f"UncExpertFusionHead: expected dim_in={k * c}, got {dim_in}"
+            )
+
+        # Split expert features: [B, K, C, h, w]
+        feats = x.view(b, k, c, h, w)
+
+        predictions = []
+        sq_sigmas = []
+
+        for i in range(k):
+            y_pred_i, sq_sigma_i = self.experts[i](feats[:, i])
+
+            predictions.append(y_pred_i)
+            sq_sigmas.append(sq_sigma_i)
+
+        # [B, K, 3, h, w]
+        preds = torch.stack(predictions, dim=1)
+        sigmas = torch.stack(sq_sigmas, dim=1)
+
+        if preds.shape != sigmas.shape:
+            raise RuntimeError(
+                "UncExpertFusionHead: preds and sigmas must have same shape. "
+                f"got preds={tuple(preds.shape)}, sigmas={tuple(sigmas.shape)}"
+            )
+
+        # -------------------------------------------------
+        # MoE part: uncertainty-based gating
+        # -------------------------------------------------
+        eps = float(self.config.eps)
+
+        inv_var = 1.0 / (sigmas.float() + eps)
+
+        # Normalize over expert dimension K
+        weights = inv_var / inv_var.sum(dim=1, keepdim=True)
+
+        # Weighted coordinate prediction
+        y_hat = (weights * preds.float()).sum(dim=1)
+
+        # Optional fused uncertainty for compatibility
+        u_hat = None
+        if self.config.return_fused_uncertainty:
+            # Full coordinate variance: [B, 3, h, w]
+            sq_sigma_hat = (weights * sigmas.float()).sum(dim=1)
+
+            # Old SCR uncertainty path usually expects [B, 1, h, w]
+            u_hat = sq_sigma_hat.mean(dim=1, keepdim=True)
+
+        # Save tensors for MoGU loss
+        self.last_expert_preds = preds
+        self.last_sq_sigmas = sigmas
+        self.last_moe_weights = weights
+
+        # Reshape back to leading dims
+        d = y_hat.shape[1]
+        y_hat = y_hat.view(*leading_dims, d, h, w)
+
+        if u_hat is not None:
+            u_hat = u_hat.view(*leading_dims, 1, h, w)
+
+        return y_hat, u_hat
+    
+    def compute_mogu_loss(self, target: torch.Tensor) -> torch.Tensor:
+        """Compute MoGU-style weighted Gaussian NLL.
+
+        Must be called after forward().
+
+        Args:
+            target:
+                Ground-truth scene coordinates with shape:
+                    (..., 3, h, w)
+
+                It should be the same target tensor used by the normal SCR loss.
+
+        Uses:
+            self.last_expert_preds: [B, K, 3, h, w]
+            self.last_sq_sigmas:    [B, K, 3, h, w]
+            self.last_moe_weights:  [B, K, 3, h, w]
+
+        Returns:
+            Scalar MoGU loss.
+        """
+
+        if self.last_expert_preds is None:
+            raise RuntimeError(
+                "compute_mogu_loss() called before UncExpertFusionHead.forward()."
+            )
+
+        preds = self.last_expert_preds.float()
+        sigmas = self.last_sq_sigmas.float()
+        weights = self.last_moe_weights.float()
+
+        b, k, d, h, w = preds.shape
+
+        target = target.view(-1, d, h, w).float()
+
+        if target.shape != (b, d, h, w):
+            raise ValueError(
+                f"compute_mogu_loss: expected target shape {(b, d, h, w)}, "
+                f"got {tuple(target.shape)}"
+            )
+
+        target = target[:, None].expand_as(preds)
+
+        sigmas = sigmas.clamp_min(float(self.config.eps))
+
+        nll = torch.nn.functional.gaussian_nll_loss(
+            input=preds,
+            target=target,
+            var=sigmas,
+            reduction="none",
+        )
+
+        # MoGU:
+        # loss = sum_e weight_e * GaussianNLL(pred_e, target, sigma_e)
+        mogu_loss = (weights * nll).sum(dim=1).mean()
+
+        self.last_mogu_loss = mogu_loss
+
+        return mogu_loss
+
+    def unfreeze_experts_if_needed(self, iteration: int):
+        # Keep same API as LateFusionCoordHead, but only applies to MLPHeads.
+        # UncHeads are trainable from the beginning.
+        return
+
+    def get_param_groups(self, min_lr: float, max_lr: float) -> list[dict]:
+        groups = []
+
+        mlp_params = []
+        unc_params = []
+
+        for expert in self.experts:
+            mlp_params.extend(list(expert.mlp_head.parameters()))
+            unc_params.extend(list(expert.unc_head.parameters()))
+
+        if mlp_params:
+            groups.append({
+                "name": "mlp_experts",
+                "params": mlp_params,
+                "lr": max_lr,
+                "max_lr": max_lr,
+                "min_lr": min_lr,
+            })
+
+        if unc_params:
+            groups.append({
+                "name": "unc_heads",
+                "params": unc_params,
+                "lr": max_lr,
+                "max_lr": max_lr,
+                "min_lr": min_lr,
+            })
+
+        handled = set(id(p) for p in mlp_params + unc_params)
+
+        other_params = [
+            p for p in self.parameters()
+            if id(p) not in handled
+        ]
+
+        if other_params:
+            groups.append({
+                "name": "other",
+                "params": other_params,
+                "lr": max_lr,
+                "max_lr": max_lr,
+                "min_lr": min_lr,
+            })
+
+        return groups
+
+
 # HeadConfig = MLPHead.Config | TransformerHead.Config | FusionHead.Config | pathlib.Path
-HeadConfig = MLPHead.Config | TransformerHead.Config | FusionHead.Config | LateFusionCoordHead.Config | pathlib.Path
+HeadConfig = MLPHead.Config | TransformerHead.Config | FusionHead.Config | LateFusionCoordHead.Config | UncExpertFusionHead.Config | pathlib.Path
 
 def create_head(head_config: HeadConfig) -> SCRHead:
     """Create a head from a head configuration."""
