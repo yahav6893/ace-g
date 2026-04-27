@@ -564,7 +564,9 @@ class SingleSceneTrainer:
             wb_log_dict = {}
             if hasattr(self.regressor.head, 'last_l2_reg_loss') and self.regressor.head.last_l2_reg_loss is not None:
                 wb_log_dict["train/loss_l2_reg"] = self.regressor.head.last_l2_reg_loss.item()
-            
+            if hasattr(self.regressor.head, 'last_mogu_loss') and self.regressor.head.last_mogu_loss is not None:
+                wb_log_dict["train/loss_mogu"] = self.regressor.head.last_mogu_loss.item()
+
             for i, pg in enumerate(self.training_scheduler.optimizer.param_groups):
                 name = pg.get("name", f"group_{i}")
                 wb_log_dict[f"train/lr_{name}"] = pg["lr"]
