@@ -265,9 +265,11 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
     print_stage_header("GATE WEIGHTS")
     ensure_ace_g_importable(args.repo_root)
     run = setup_wandb_logging(args, "gate-weights")
-    if run:
-        import wandb
-        table = wandb.Table(columns=["image", "expert_idx", "mean", "min", "max", "win_pct"])
+    eval_reg = getattr(args, "eval_registration", False)
+    if eval_reg:
+        from ace_g import data_io, losses, utils
+
+
 
     cfg_path = expand(args.config_path)
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
@@ -281,7 +283,13 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
         encs[i] = encs[i].to(device).eval()
     head = head.to(device).eval()
 
-    paths = sorted(glob.glob(args.rgb_glob))[: args.num_images]
+    paths = sorted(glob.glob(args.rgb_glob))
+    if getattr(args, "random_sample", False):
+        import random
+        random.seed(getattr(args, "seed", 42))
+        random.shuffle(paths)
+    paths = paths[: args.num_images]
+    
     if not paths:
         if run: run.finish(exit_code=1)
         raise ScriptError(f"No images matched: {args.rgb_glob}")
@@ -290,8 +298,9 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
     print(f"head_path  : {expand(args.head_path)}")
     print(f"device     : {device}")
     print(f"use_half   : {use_half}")
+    print(f"eval_reg   : {eval_reg}")
     print(f"images     : {len(paths)}")
-    print(f"first_image: {paths[0]}")
+    all_wts = []
 
     with torch.no_grad():
         for p in paths:
@@ -302,22 +311,123 @@ def cmd_gate_weights(args: argparse.Namespace) -> int:
                 wts = extract_softmax_weights(head, feats)
             w = wts[0]
             k = w.shape[0]
+            if not all_wts:
+                all_wts = [[] for _ in range(k)]
+            for idx in range(k):
+                all_wts[idx].append(w[idx].detach().cpu().numpy().flatten())
             mean = w.mean(dim=(1, 2)).detach().float().cpu().numpy()
             mn = w.amin(dim=(1, 2)).detach().float().cpu().numpy()
             mx = w.amax(dim=(1, 2)).detach().float().cpu().numpy()
             winner = w.argmax(dim=0).detach().cpu().numpy()
             win_frac = np.bincount(winner.reshape(-1), minlength=k) / winner.size
+
+            if eval_reg:
+                p_path = Path(p)
+                pose_path = p_path.parent.parent / "poses" / f"{p_path.stem}.txt"
+                calib_path = p_path.parent.parent / "calibration" / f"{p_path.stem}.txt"
+                if not pose_path.exists() or not calib_path.exists():
+                    raise ScriptError(f"Missing GT pose or calib for {p}")
+
+                pose_c2w = data_io.load_pose(pose_path)
+                w2c_44 = pose_c2w.inverse()
+                w2c_b34 = w2c_44[:3, :4].unsqueeze(0).to(device)
+
+                calib = data_io.load_calibration(calib_path)
+                im = Image.open(p)
+                w_orig, h_orig = im.size
+                s = max(w_orig, h_orig)
+                scale = args.max_side / float(s) if s > args.max_side else 1.0
+
+                if isinstance(calib, float):
+                    fx = fy = calib
+                    cx = w_orig / 2
+                    cy = h_orig / 2
+                else:
+                    fx = calib[0, 0]
+                    fy = calib[1, 1]
+                    cx = calib[0, 2]
+                    cy = calib[1, 2]
+
+                intrinsics = torch.eye(3)
+                intrinsics[0, 0] = fx * scale
+                intrinsics[1, 1] = fy * scale
+                intrinsics[0, 2] = cx * scale
+                intrinsics[1, 2] = cy * scale
+                image_from_camera_b33 = intrinsics.unsqueeze(0).to(device)
+
+                sub_h = int(round(x.shape[-2] / feats.shape[-2]))
+                pixel_grid_2hw = utils.get_pixel_grid(sub_h).to(device)
+                pixel_grid_2hw = pixel_grid_2hw[:, :feats.shape[-2], :feats.shape[-1]]
+                _, h_f, w_f = pixel_grid_2hw.shape
+                target_px_b2 = pixel_grid_2hw.reshape(2, -1).permute(1, 0)
+                target_coords_b3 = torch.zeros((h_f * w_f, 3), device=device)
+
+                experts_coords = []
+                b_f, kc_f, h_f_feat, w_f_feat = feats.shape
+                c_f = kc_f // k
+                feats_reshaped = feats.view(b_f, k, c_f, h_f_feat, w_f_feat)
+                with torch.autocast("cuda", enabled=use_half):
+                    for idx in range(k):
+                        yi, _ = head.expert_heads[idx](feats_reshaped[:, idx])
+                        pred_coords_b3 = yi.permute(0, 2, 3, 1).reshape(-1, 3).float()
+                        experts_coords.append(pred_coords_b3)
+
+                    y_total, _ = head(feats)
+                    pred_coords_total_b3 = y_total.permute(0, 2, 3, 1).reshape(-1, 3).float()
+
+                n_patches = h_f * w_f
+                w2c_b34_exp = w2c_b34.expand(n_patches, 3, 4)
+                image_from_camera_b33_exp = image_from_camera_b33.expand(n_patches, 3, 3)
+
+                reg_losses = []
+                for idx in range(k):
+                    _, _, _, _, dists_2d = losses.compute_loss(
+                        pred_coords=experts_coords[idx],
+                        pred_uncertainties=None,
+                        w2c_b34=w2c_b34_exp,
+                        image_from_camera_b33=image_from_camera_b33_exp,
+                        target_pixels=target_px_b2,
+                        target_coords=target_coords_b3,
+                        supervision_type="2d",
+                        use_depth_as_prior=False,
+                    )
+                    reg_losses.append(dists_2d.mean().item())
+
+                _, _, _, _, dists_2d_tot = losses.compute_loss(
+                    pred_coords=pred_coords_total_b3,
+                    pred_uncertainties=None,
+                    w2c_b34=w2c_b34_exp,
+                    image_from_camera_b33=image_from_camera_b33_exp,
+                    target_pixels=target_px_b2,
+                    target_coords=target_coords_b3,
+                    supervision_type="2d",
+                    use_depth_as_prior=False,
+                )
+                total_reg_loss = dists_2d_tot.mean().item()
+
             print(f"\n--- {img_name} ---")
             for idx in range(k):
-                print(
-                    f"expert[{idx}] mean={mean[idx]:.4f} min={mn[idx]:.4f} "
-                    f"max={mx[idx]:.4f} win%={100 * win_frac[idx]:.1f}"
-                )
-                if run:
-                    table.add_data(img_name, idx, float(mean[idx]), float(mn[idx]), float(mx[idx]), float(100 * win_frac[idx]))
-    
+                msg = f"expert[{idx}] mean={mean[idx]:.4f} min={mn[idx]:.4f} max={mx[idx]:.4f} win%={100 * win_frac[idx]:.1f}"
+                if eval_reg:
+                    msg += f" reg_loss_px={reg_losses[idx]:.2f}"
+                print(msg)
+            
+            if eval_reg:
+                print(f"Total combined reg_loss_px={total_reg_loss:.2f}")
+
     if run:
-        run.log({"gate_weights_distribution": table})
+        import wandb
+        log_dict = {}
+        for idx in range(len(all_wts)):
+            data = np.concatenate(all_wts[idx])
+            try:
+                log_dict[f"expert_{idx}_weights"] = wandb.Histogram(data)
+            except ValueError:
+                unique_vals = np.unique(data)
+                num_bins = max(1, min(64, len(unique_vals)))
+                hist, edges = np.histogram(data, bins=num_bins)
+                log_dict[f"expert_{idx}_weights"] = wandb.Histogram(np_histogram=(hist.tolist(), edges.tolist()))
+        run.log(log_dict)
         run.finish()
         
     print("\nDone.")
@@ -457,9 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_gw.add_argument("--head-path", required=True, help="Path to the trained head checkpoint")
     p_gw.add_argument("--rgb-glob", required=True, help="Glob for sample RGB test images")
     p_gw.add_argument("--num-images", type=int, default=25)
+    p_gw.add_argument("--random-sample", action="store_true", help="Randomly sample images instead of picking the first N")
+    p_gw.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     p_gw.add_argument("--max-side", type=int, default=640)
     p_gw.add_argument("--device", default=None)
     p_gw.add_argument("--use-half", action="store_true")
+    p_gw.add_argument("--eval-registration", action="store_true", help="Evaluate patch-level 2D registration loss against ground truth")
     p_gw.set_defaults(func=cmd_gate_weights)
 
     p_gl = sp.add_parser("gate-last-layer", help="Inspect gating last-layer params, optionally with a probe image")

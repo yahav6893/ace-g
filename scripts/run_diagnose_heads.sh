@@ -15,7 +15,7 @@ MODEL_PREFIX="latefusion_l2_unfreeze_N2_dinov2reg_dpt-cambridge-shopfacade"
 
 # Note: Adjust HEAD_PATH based on whether you used --promote-heads or not
 # HEAD_PATH="${OUTPUT_ROOT}/promoted/${MODEL_PREFIX}_head.pt"
-HEAD_PATH="wandb://yahav6893/DACE/model__latefusion_l2_unfreeze_N2_dinov2reg_dpt-cambridge-shopfacade:v4"
+HEAD_PATH="wandb://yahav6893/DACE/model__latefusion_l2_unfreeze_N2_dinov2reg_dpt-cambridge-shopfacade:v5"
 CONFIG_PATH="${REPO_ROOT}/configs_custom/${CONFIG_NAME}"
 RGB_GLOB="${DATASET_ROOT}/${SCENES}/test/rgb/*.png"
 
@@ -60,7 +60,7 @@ case "$CMD" in
       --config-path "${CONFIG_PATH}" \
       --head-path "${HEAD_PATH}" \
       --rgb-glob "${RGB_GLOB}" \
-      --use-half "$@"
+      --use-half --random-sample --eval-registration "$@"
     ;;
   gate-last-layer)
     python "${REPO_ROOT}/scripts/diagnose_heads.py" --repo-root "${REPO_ROOT}" --wandb-log gate-last-layer \
