@@ -1125,8 +1125,11 @@ class UncExpertFusionHead(SCRHead):
         # MoE part: uncertainty-based gating
         # -------------------------------------------------
         eps = float(self.config.eps)
-
-        inv_var = 1.0 / (sigmas.float() + eps)
+        sigmas_safe = sigmas.float().clamp(
+            min=float(self.config.var_min),
+            max=float(self.config.var_max),
+        )
+        inv_var = 1.0 / (sigmas_safe.float() + eps)
 
         # Normalize over expert dimension K
         weights = inv_var / inv_var.sum(dim=1, keepdim=True)
@@ -1199,8 +1202,10 @@ class UncExpertFusionHead(SCRHead):
 
         target = target[:, None].expand_as(preds)
 
-        sigmas = sigmas.clamp_min(float(self.config.eps))
-
+        sigmas = sigmas.clamp(
+            min=float(self.config.var_min),
+            max=float(self.config.var_max),
+        )
         nll = torch.nn.functional.gaussian_nll_loss(
             input=preds,
             target=target,
