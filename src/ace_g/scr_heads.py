@@ -1141,14 +1141,14 @@ class UncExpertFusionHead(SCRHead):
         u_hat = None
         if self.config.return_fused_uncertainty:
             # Full coordinate variance: [B, 3, h, w]
-            sq_sigma_hat = (weights * sigmas.float()).sum(dim=1)
+            sq_sigma_hat = (weights * sigmas_safe.float()).sum(dim=1)
 
             # Old SCR uncertainty path usually expects [B, 1, h, w]
             u_hat = sq_sigma_hat.mean(dim=1, keepdim=True)
 
         # Save tensors for MoGU loss
         self.last_expert_preds = preds
-        self.last_sq_sigmas = sigmas
+        self.last_sq_sigmas = sigmas_safe
         self.last_moe_weights = weights
 
         # Reshape back to leading dims
