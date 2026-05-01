@@ -1,6 +1,6 @@
 sst:
   output_dir: ~/dace/outputs
-  num_iterations: 10000
+  num_iterations: 50000
   train_head: true
 
   # --- Late fusion head: 2 expert MLPHeads + gating weights ---
@@ -8,12 +8,6 @@ sst:
     obj_type: ace_g.scr_heads.UncExpertFusionHead
     dim_in: 2048
     num_experts: 2
-
-    expert_head_paths:
-      - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
-      - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
-    freeze_loaded_experts: true
-    force_shared_mean: true   # recommended unless you verified both heads have identical mean
 
     expert_head:
       obj_type: ace_g.scr_heads.MLPHead
@@ -55,7 +49,7 @@ sst:
     path: null
 
   # --- ACE-G 5min defaults ---
-  max_buffer_size: 2_000_000
+  max_buffer_size: 4_000_000
   schedule_config:
     learning_rate_div_factor: 25
     learning_rate_final_div_factor: 10000

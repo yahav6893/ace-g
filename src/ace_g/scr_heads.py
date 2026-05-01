@@ -912,6 +912,8 @@ class UncExpertFusionHead(SCRHead):
 
         # MoE uncertainty gating
         eps: float = 1e-8
+        var_min: float = 1e-2
+        var_max: float = 100.0
         mogu_loss_weight: float = 1.0
 
         # Whether to return a fused one-channel uncertainty as u_hat
