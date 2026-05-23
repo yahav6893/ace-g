@@ -3,7 +3,7 @@
 
 # cache
 cache/
-
+configs_auto/
 # outputs
 outputs/
 wandb/

@@ -918,6 +918,9 @@ class UncExpertFusionHead(SCRHead):
 
         # Whether to return a fused one-channel uncertainty as u_hat
         return_fused_uncertainty: bool = False
+        
+        # Sanity check: force a specific expert
+        sanity_check_force_expert: int | None = None
 
         # SCRHead base knobs
         mean: torch.Tensor | None = None
@@ -1133,7 +1136,12 @@ class UncExpertFusionHead(SCRHead):
 
         # Normalize over expert dimension K
         weights = inv_var / inv_var.sum(dim=1, keepdim=True)
-
+        
+        # SANITY CHECK: force a specific expert
+        if self.config.sanity_check_force_expert is not None:
+            weights = torch.zeros_like(weights)
+            weights[:, self.config.sanity_check_force_expert] = 1.0
+        
         # Weighted coordinate prediction
         y_hat = (weights * preds.float()).sum(dim=1)
 

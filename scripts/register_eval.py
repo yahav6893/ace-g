@@ -21,6 +21,7 @@ import yoco
 
 from _common import (
     ScriptError,
+    config_path_from_args,
     build_subprocess_env,
     default_output_paths,
     ensure_dir,
@@ -68,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--extra-env", action="append", default=[])
     p.add_argument("--pythonpath-prepend", action="append", default=[])
     p.add_argument("--dry-run", action="store_true")
+
+    group_cfg = p.add_mutually_exclusive_group(required=True)
+    group_cfg.add_argument("--config-name", help="Config filename under <repo>/configs_custom/ (placeholder until names are finalized)")
+    group_cfg.add_argument("--config-path", help="Absolute config path (use this if config is not under configs_custom)")
+
     return p.parse_args()
 
 
@@ -89,8 +95,8 @@ def main() -> int:
     train_status = read_json(train_status_json)
     if not isinstance(train_status, dict):
         raise ScriptError(f"Expected scene-keyed dict in train status JSON: {train_status_json}")
-
-    model_name = args.model_name or infer_model_name(train_status_json)
+    config_path = config_path_from_args(repo_root, args.config_name, args.config_path)
+    model_name = args.model_name or config_path.stem
     dataset_name = dataset_root.name
     scenes = resolve_scenes(dataset_root, args.scenes) if args.scenes else list(train_status.keys())
     wandb_group = args.wandb_group or f"{slugify(model_name)}__{slugify(dataset_name)}"

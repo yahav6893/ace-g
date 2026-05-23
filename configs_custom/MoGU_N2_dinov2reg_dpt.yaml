@@ -1,6 +1,6 @@
 sst:
   output_dir: ~/dace/outputs
-  num_iterations: 25000
+  num_iterations: 50000
   train_head: true
 
   # --- Late fusion head: 2 expert MLPHeads + gating weights ---
@@ -24,8 +24,8 @@ sst:
       homogeneous_max_scale: 4.0
       use_uncertainty: false
 
-    mogu_loss_weight: 1.0
-    var_min: 1e-2
+    mogu_loss_weight: 10.0
+    var_min: 1e-1
     var_max: 100.0
 
     unc_head:
@@ -38,6 +38,7 @@ sst:
 
   eps: 1.0e-8
   return_fused_uncertainty: false
+  repro_loss_soft_clamp_min: 5
 
   # --- Encoder: ONE list (vanilla DINOv2, DPTv2) ---
   encoder:
@@ -59,6 +60,8 @@ sst:
   # --- ACE-G 5min defaults ---
   max_buffer_size: 4_000_000
   schedule_config:
+    learning_rate_min: 0.00005
+    learning_rate_max: 0.0005
     learning_rate_div_factor: 25
     learning_rate_final_div_factor: 10000
   use_feature_aug: true

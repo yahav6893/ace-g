@@ -9,7 +9,7 @@ sst:
     obj_type: ace_g.encoders.DPTv2Encoder
     kwargs:
       model_name: vitl
-      checkpoint: /content/drive/MyDrive/ace_cache/depth_anything/depth_anything_v2_vitl.pth
+      checkpoint: /home/eng/vinokuy2/dace/cache/depth_anything/depth_anything_v2_vitl.pth
   max_buffer_size: 4_000_000
   schedule_config:
     learning_rate_div_factor: 25

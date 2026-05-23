@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="${HOME}/dace/ace-g"
 DATASET_ROOT="${HOME}/dace/datasets/cambridge"
-CONFIG_NAME="MoGU_N2_dinov2reg_dpt.yaml"
+CONFIG_NAME="dptv2_vitl.yaml"
 SCENES="shopfacade"
 OUTPUT_ROOT="${HOME}/dace/outputs"
 CACHE_ROOT="${HOME}/dace/cache"
@@ -70,6 +70,7 @@ echo ">>> STAGE 2: REGISTRATION & EVALUATION"
 python "${REPO_ROOT}/scripts/register_eval.py" \
   --repo-root "${REPO_ROOT}" \
   --dataset-root "${DATASET_ROOT}" \
+  --config-name "${CONFIG_NAME}" \
   --output-root "${OUTPUT_ROOT}" \
   --cache-root "${CACHE_ROOT}" \
   --torch-home "${TORCH_HOME}" \

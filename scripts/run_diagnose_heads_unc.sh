@@ -10,13 +10,13 @@ OUTPUT_ROOT="${HOME}/dace/outputs"
 # ==========================================================
 # Uncertainty / MoGU diagnostics configuration
 # ==========================================================
-CONFIG_NAME="MoGU_N2_dinov2reg_dpt.yaml"
-SCENES="shopfacade"
-MODEL_PREFIX="MoGU_N2_dinov2reg_dpt-cambridge-shopfacade"
+CONFIG_NAME="mogu_greatcourt_it50000_buf4M_pre_unfrozen_mlw0p1.yaml"
+SCENES="greatcourt"
+MODEL_PREFIX="mogu_greatcourt_it50000_buf4M_pre_unfrozen_mlw0p1-cambridge-greatcourt"
 
 # If you promoted heads locally, use this instead:
 # HEAD_PATH="${OUTPUT_ROOT}/promoted/${MODEL_PREFIX}_head.pt"
-HEAD_PATH="wandb://yahav6893/DACE/model__MoGU_N2_dinov2reg_dpt-cambridge-shopfacade:v5"
+HEAD_PATH="wandb://yahav6893/DACE_greatcourt/model__mogu_greatcourt_it50000_buf4M_pre_unfrozen_mlw0p1-cambridge-greatcourt:v0"
 
 CONFIG_PATH="${REPO_ROOT}/configs_custom/${CONFIG_NAME}"
 RGB_GLOB="${DATASET_ROOT}/${SCENES}/test/rgb/*.png"
