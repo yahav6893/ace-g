@@ -5,10 +5,8 @@ REPO_ROOT="${HOME}/dace/ace-g"
 OUTPUT_DIR="${HOME}/dace/outputs/alpha_test"
 SCENE="shopfacade"
 SEED=42
-EPOCHS=10
-LR="1e-4"
-WEIGHT_DECAY="1e-4"
-BATCH_SIZE=128
+WANDB_ENTITY="yahav6893"
+WANDB_PROJECT="DACE_gating"
 
 # Conda and environment initialization
 eval "$(conda shell.bash hook)"
@@ -53,10 +51,8 @@ echo "=========================================================="
 python "${REPO_ROOT}/scripts/train_gating_classifier.py" \
   --dataset_root "${DATASET_ROOT}" \
   --scene "${SCENE}" \
-  --epochs "${EPOCHS}" \
-  --lr "${LR}" \
-  --weight_decay "${WEIGHT_DECAY}" \
-  --batch_size "${BATCH_SIZE}" \
+  --wandb-entity "${WANDB_ENTITY}" \
+  --wandb-project "${WANDB_PROJECT}" \
   "$@"
 
 echo "=========================================================="

@@ -6,11 +6,9 @@ DATASET_ROOT="${HOME}/dace/datasets/cambridge"
 SCENES="shopfacade" # default scene, can be overridden by passing scenes as arguments
 OUTPUT_ROOT="${HOME}/dace/outputs/alpha_test"
 SEED=42
-EPOCHS=10
-LR="1e-4"
-WEIGHT_DECAY="1e-4"
-BATCH_SIZE=128
 SPLIT="test"
+WANDB_ENTITY="yahav6893"
+WANDB_PROJECT="DACE_gating"
 
 # Conda and environment initialization
 eval "$(conda shell.bash hook)"
@@ -64,10 +62,8 @@ for SCENE in $SCENES; do
   python "${REPO_ROOT}/scripts/train_gating_classifier.py" \
     --dataset_root "${SCENE_OUTPUT_DIR}" \
     --scene "${SCENE}" \
-    --epochs "${EPOCHS}" \
-    --lr "${LR}" \
-    --weight_decay "${WEIGHT_DECAY}" \
-    --batch_size "${BATCH_SIZE}"
+    --wandb-entity "${WANDB_ENTITY}" \
+    --wandb-project "${WANDB_PROJECT}"
 
   echo "----------------------------------------------------------"
   echo " STAGE 2: RUNNING PNP CAMERA LOCALIZATION EVALUATION"

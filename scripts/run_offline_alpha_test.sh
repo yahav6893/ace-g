@@ -3,7 +3,9 @@ set -euo pipefail
 
 REPO_ROOT="${HOME}/dace/ace-g"
 DATASET_ROOT="${HOME}/dace/datasets/cambridge"
-SCENES="shopfacade" # kingscollege oldhospital stmaryschurch greatcourt"
+#SCENES="shopfacade kingscollege oldhospital stmaryschurch greatcourt"
+SCENES="kingscollege oldhospital stmaryschurch greatcourt"
+
 OUTPUT_DIR="${HOME}/dace/outputs/alpha_test"
 MAX_BUFFER_SIZE="4000000"
 SAMPLES_PER_IMAGE="1024"  # Increase this (e.g. 4000 or 10000) to sample more patches per image

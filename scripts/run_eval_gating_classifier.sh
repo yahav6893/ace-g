@@ -38,19 +38,19 @@ export CUDA_VISIBLE_DEVICES=$BEST_GPU_ID
 echo "Selected GPU $BEST_GPU_ID with ${BEST_GPU_FREE} MB free memory."
 
 for SCENE in $SCENES; do
-  echo ">>> Evaluating gating classifier on scene: ${SCENE}"
   SCENE_OUTPUT_DIR="${OUTPUT_DIR}/${SCENE}"
   
   MODEL0="${HOME}/dace/outputs/DINOv2_vitl_reg-cambridge-${SCENE}_map.yaml"
   MODEL1="${HOME}/dace/outputs/dptv2_vitl-cambridge-${SCENE}_map.yaml"
   GATING_HEAD="${SCENE_OUTPUT_DIR}/${SCENE}_gating_head_best.pt"
+  echo ">>> Evaluating gating head ${GATING_HEAD} on scene: ${SCENE}"
 
   if [ ! -f "$GATING_HEAD" ]; then
     echo "ERROR: Gating head weights not found at ${GATING_HEAD}. Please train first!"
     exit 1
   fi
 
-  python "${REPO_ROOT}/scripts/eval_gating_classifier.py" \
+  python "${REPO_ROOT}/scripts/eval_gating_classifier_no_alpha_bins.py" \
     --model0 "${MODEL0}" \
     --model1 "${MODEL1}" \
     --gating_head "${GATING_HEAD}" \
