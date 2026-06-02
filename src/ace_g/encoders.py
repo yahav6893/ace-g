@@ -238,6 +238,125 @@ class DINOv2Encoder(Encoder):
             .reshape(*leading_dims, -1, h // self.subsample_factor, w // self.subsample_factor)
         )
         return patch_features
+
+
+class DINOv3Encoder(Encoder):
+    """DINOv3 encoder, used to extract features from the input images.
+
+    The number of output channels is not modified and depends on the chosen model.
+
+    See https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/.
+
+    Supported model names:
+        dinov3_vits16
+        dinov3_vits16plus
+        dinov3_vitb16
+        dinov3_vitl16
+        dinov3_vith16plus
+        dinov3_vit7b16
+    """
+
+    supports_rgb = True
+
+    def __init__(
+        self,
+        model_name: str = "dinov3_vitl16",
+        repo_dir: str | pathlib.Path | None = None,
+        checkpoint: str | pathlib.Path | None = None,
+    ) -> None:
+        """Initialize the DINOv3 encoder.
+
+        Args:
+            model_name: Name of the model to load using torch.hub.load. See class docstring for supported models.
+            repo_dir: Optional path to a local cloned facebookresearch/dinov3 repository.
+            checkpoint: Optional path/URL to the pretrained checkpoint weights.
+        """
+        super(DINOv3Encoder, self).__init__()
+
+        if checkpoint is not None:
+            pretrained_arg = False
+        else:
+            pretrained_arg = True
+
+        if repo_dir is not None:
+            self.dinov3 = torch.hub.load(
+                str(repo_dir),
+                model_name,
+                source="local",
+                verbose=True,
+                trust_repo=True,
+                skip_validation=True,
+                pretrained=pretrained_arg
+            )
+        else:
+            hub = "facebookresearch/dinov3"
+            self.dinov3 = torch.hub.load(
+                hub,
+                model_name,
+                source="github",
+                verbose=True,
+                trust_repo=True,
+                skip_validation=True,
+                pretrained=pretrained_arg
+            )
+
+        if checkpoint is not None:
+            state_dict = torch.load(pathlib.Path(checkpoint), map_location="cpu", weights_only=False)
+            if isinstance(state_dict, dict):
+                if "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+                    state_dict = state_dict["state_dict"]
+                elif "model" in state_dict and isinstance(state_dict["model"], dict):
+                    state_dict = state_dict["model"]
+
+            incompatible = self.dinov3.load_state_dict(state_dict, strict=False)
+            if getattr(incompatible, "missing_keys", None):
+                _logger.warning(
+                    f"DINOv3Encoder: missing keys while loading backbone (showing up to 10): "
+                    f"{incompatible.missing_keys[:10]}"
+                )
+            if getattr(incompatible, "unexpected_keys", None):
+                _logger.warning(
+                    f"DINOv3Encoder: unexpected keys while loading backbone (showing up to 10): "
+                    f"{incompatible.unexpected_keys[:10]}"
+                )
+
+        self.subsample_factor = self.dinov3.patch_embed.patch_size[0]  # type: ignore
+        self.dim_out = self.dinov3.embed_dim  # type: ignore
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Compute features for images.
+
+        The image is cropped to a size that is a multiple of the patch size (i.e., right and bottom might be cropped).
+        Spatial dimensions are reduced by the patch size (e.g., for patches of size 16, H' = H // 16).
+        See subsample_factor.
+
+        For grayscale images the input is broadcasted to 3 channels.
+
+        Args:
+            images: Input images. Shape (..., 3 or 1, H, W).
+
+        Returns:
+            Features for image patches. Shape (..., dim_feat, H', W').
+        """
+        leading_dims = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.view(-1, c, h, w)
+        if c == 1:  # for grayscale images, pass the same channel three times
+            images = images.expand(-1, 3, -1, -1)
+        images = images[
+            ...,
+            : self.subsample_factor * (h // self.subsample_factor),
+            : self.subsample_factor * (w // self.subsample_factor),
+        ]
+        features = self.dinov3.forward_features(images)  # type: ignore
+        patch_features = (
+            features["x_norm_patchtokens"]
+            .permute(0, 2, 1)
+            .reshape(*leading_dims, -1, h // self.subsample_factor, w // self.subsample_factor)
+        )
+        return patch_features
+
+
 class DPTv2Encoder(Encoder):
     """Depth Anything V2 (DINOv2-DPT) encoder.
 

@@ -3,8 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="${HOME}/dace/ace-g"
 DATASET_ROOT="${HOME}/dace/datasets/cambridge"
-CONFIG_NAME="dptv2_vitl.yaml"
-SCENES="shopfacade"
+CONFIG_NAME="DINOv3_vitl.yaml"
+SCENES="kingscollege oldhospital stmaryschurch greatcourt"
 OUTPUT_ROOT="${HOME}/dace/outputs"
 CACHE_ROOT="${HOME}/dace/cache"
 TORCH_HOME="${HOME}/dace/cache/torch"
