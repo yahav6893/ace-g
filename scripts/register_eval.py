@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-name", default=None, help="Override model name. Default: parsed from status filename")
     p.add_argument("--scenes", nargs="*", default=None, help="Optional subset of scenes to register/evaluate")
     p.add_argument("--skip-register", action="store_true", help="Eval only. Assumes <session>_reg.yaml already exists under output root")
+    p.add_argument("--session-prefix", default=None, help="Optional prefix before '<model>-<dataset>-<scene>'")
 
     p.add_argument("--wandb-entity", default="yahav6893")
     p.add_argument("--wandb-project", default="dace")
@@ -135,7 +136,8 @@ def main() -> int:
     # Let's see parse_args
     # I didn't see --config-name in register_eval.py.
     # Let me check.
-    run_name = f"register-eval__{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
+    run_prefix = f"{slugify(args.session_prefix)}__" if args.session_prefix else ""
+    run_name = f"register-eval__{run_prefix}{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
     wb_run = maybe_init_wandb(
         enabled=not args.disable_wandb,
         project=args.wandb_project,
@@ -155,6 +157,7 @@ def main() -> int:
             "dataset_name": dataset_name,
             "scenes": scenes,
             "skip_register": args.skip_register,
+            "session_prefix": args.session_prefix,
         },
     )
 
@@ -271,8 +274,9 @@ def main() -> int:
         rows.append(row)
         status_rows[scene] = row
 
-    summary_csv = write_csv(output_dirs["summaries"] / f"{slugify(model_name)}__{slugify(dataset_name)}__eval_summary.csv", rows)
-    summary_json = write_json(output_dirs["summaries"] / f"{slugify(model_name)}__{slugify(dataset_name)}__eval_summary.json", rows)
+    summary_prefix = f"{slugify(args.session_prefix)}__" if args.session_prefix else ""
+    summary_csv = write_csv(output_dirs["summaries"] / f"{summary_prefix}{slugify(model_name)}__{slugify(dataset_name)}__eval_summary.csv", rows)
+    summary_json = write_json(output_dirs["summaries"] / f"{summary_prefix}{slugify(model_name)}__{slugify(dataset_name)}__eval_summary.json", rows)
 
     print_stage_header("REGISTER + EVAL SUMMARY")
     print(json.dumps(rows, indent=2))
@@ -284,14 +288,14 @@ def main() -> int:
         wandb_log_artifact_file(
             wb_run,
             path=summary_csv,
-            artifact_name=f"eval-summary-csv__{model_name}__{dataset_name}",
+            artifact_name=f"eval-summary-csv__{summary_prefix}{model_name}__{dataset_name}",
             artifact_type="eval-summary",
             metadata={"model_name": model_name, "dataset_name": dataset_name, "format": "csv"},
         )
         wandb_log_artifact_file(
             wb_run,
             path=summary_json,
-            artifact_name=f"eval-summary-json__{model_name}__{dataset_name}",
+            artifact_name=f"eval-summary-json__{summary_prefix}{model_name}__{dataset_name}",
             artifact_type="eval-summary",
             metadata={"model_name": model_name, "dataset_name": dataset_name, "format": "json"},
         )

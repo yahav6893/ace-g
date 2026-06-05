@@ -16,6 +16,39 @@ from ace_g import utils
 dataset_stats = collections.defaultdict(int)
 
 
+def project_scene_coords_to_pixels(
+    pred_coords: torch.Tensor,
+    w2c_b34: torch.Tensor,
+    image_from_camera_b33: torch.Tensor,
+    depth_min: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project world-space scene coordinates to pixels.
+
+    Args:
+        pred_coords: World-space scene coordinates, shape (..., 3).
+        w2c_b34: World-to-camera transform, shape broadcast-compatible with (..., 3, 4).
+        image_from_camera_b33: Camera intrinsics, shape broadcast-compatible with (..., 3, 3).
+        depth_min: Minimum depth used only to avoid division by zero while projecting.
+
+    Returns:
+        pred_pixels: Projected pixel coordinates, shape (..., 2).
+        pred_coords_c: Camera-space coordinates, shape (..., 3).
+        pred_pixels_h: Homogeneous projected pixels after z clamping, shape (..., 3, 1).
+    """
+    pred_coords_w_b31 = pred_coords.unsqueeze(-1)
+    pred_coords_w_b41 = utils.to_homogeneous(pred_coords_w_b31, dim=-2)
+    pred_coords_c_b31 = torch.matmul(w2c_b34, pred_coords_w_b41)
+    pred_coords_c_b3 = pred_coords_c_b31.squeeze(-1)
+
+    pred_pixels_b31 = torch.matmul(image_from_camera_b33, pred_coords_c_b31)
+
+    # Avoid division by zero for the dehomogenisation. Invalid depths are masked by callers.
+    pred_pixels_b31[..., 2, :].clamp_(min=depth_min)
+    pred_pixels_b2 = pred_pixels_b31[..., :2, 0] / pred_pixels_b31[..., 2, None, 0]
+
+    return pred_pixels_b2, pred_coords_c_b3, pred_pixels_b31
+
+
 def compute_loss(
     pred_coords: torch.Tensor,
     pred_uncertainties: torch.Tensor | None,
@@ -149,22 +182,15 @@ def compute_loss(
     # Compute 2D loss.
     if target_pixels is not None and w2c_b34 is not None and image_from_camera_b33 is not None:
         # use w to denote world coordinates and c to denote camera coordinates
-        pred_coords_w_b31 = pred_coords.unsqueeze(-1)  # b could represent any number of batch dimensions.
-        pred_coords_w_b41 = utils.to_homogeneous(pred_coords_w_b31, dim=-2)
-        pred_coords_c_b31 = torch.matmul(w2c_b34, pred_coords_w_b41)
-        pred_coords_c_b3 = pred_coords_c_b31.squeeze(-1)
-        pred_pixels_b31 = torch.matmul(image_from_camera_b33, pred_coords_c_b31)
-
-        # Avoid division by zero.
-        # Note: negative values are also clamped at +self.options.depth_min. The predicted pixel would be wrong,
-        # but that's fine since we mask them out later.
-        pred_pixels_b31[..., 2, :].clamp_(min=depth_min)
-
-        # Dehomogenise.
-        pred_pixels_b21 = pred_pixels_b31[..., :2, :] / pred_pixels_b31[..., 2, None, :]
+        pred_pixels_b2, pred_coords_c_b3, pred_pixels_b31 = project_scene_coords_to_pixels(
+            pred_coords=pred_coords,
+            w2c_b34=w2c_b34,
+            image_from_camera_b33=image_from_camera_b33,
+            depth_min=depth_min,
+        )
 
         # Measure reprojection error.
-        all_distances_2d = torch.norm(pred_pixels_b21.squeeze(-1) - target_pixels, dim=-1, p=1)
+        all_distances_2d = torch.norm(pred_pixels_b2 - target_pixels, dim=-1, p=1)
 
         # Compute mask for which depth prior should be used instead
         invalid_min_depth_b = pred_coords_c_b3[..., 2] < depth_min  # behind or close to camera plane
@@ -174,7 +200,7 @@ def compute_loss(
         # if we have access to target coord, further add a check a check on ground-truth coordinate
         target_coords_available_b = False
         if use_depth_as_prior.any() and target_coords is not None:
-            invalid_target_crds_b = torch.linalg.norm(target_coords - pred_coords_w_b31.squeeze(-1), dim=-1) > 0.1
+            invalid_target_crds_b = torch.linalg.norm(target_coords - pred_coords, dim=-1) > 0.1
             # in the previous mask, ignore pixels without GT scene coordinates (all zeros) or when depth should not be
             # used
             target_coords_available_b = target_coords.abs().sum(dim=-1) > 0.00001
@@ -232,7 +258,7 @@ def compute_loss(
 
                 # Compute the distance to target camera coordinates.
                 distances_to_prior = torch.linalg.norm(
-                    pred_coords_c_b31.squeeze(-1) - prior_targets_b31.squeeze(-1), dim=-1
+                    pred_coords_c_b3 - prior_targets_b31.squeeze(-1), dim=-1
                 )
                 if pred_uncertainties is None:
                     losses_2d_b[const_depth_prior_mask] = distances_to_prior[const_depth_prior_mask]
@@ -398,6 +424,21 @@ class ReproLoss:
             # Compute actual loss.
             return weighted_tanh(errors, loss_weight)
 
+                # Compute the dynamic tanh loss
+        elif self.type == "unc_tanh":
+            # Compute the progress over the training process.
+            schedule_weight = iteration / self.total_iterations
+
+            # Optionally scale it using the circular schedule.
+            if self.circle_schedule:
+                schedule_weight = 1 - np.sqrt(1 - schedule_weight**2)
+
+            # Compute the weight to use in the tanh loss.
+            loss_weight = (1 - schedule_weight) * self.soft_clamp + self.soft_clamp_min
+
+            # Compute actual loss.
+            return weighted_tanh(errors, loss_weight)
+
         # Compute the L1 loss
         elif self.type == "l1":
             raise NotImplementedError("L1 not checked since update.")
@@ -422,3 +463,19 @@ class ReproLoss:
             loss_logl1 = torch.log(1 + (self.soft_clamp * errors[softclamp_mask_b1])).sum()
 
             return loss_l1 + loss_logl1
+
+
+
+def calc_aleatoric_epistermic_uncertainty(self, outputs, agg_outputs, 
+                                            expert_unc, expert_weights):
+    # Aleatoric uncertainty: weighted average of expert uncertainties
+    aleatoric_unc = torch.sum(expert_unc * expert_weights, dim=1) #[batch_size, seq_len, num_feature]
+    # Epistemic uncertainty: weighted variance of expert predictions
+    epistemic_unc = None
+    for i in range(self.args.num_experts):
+        expert_diff = (agg_outputs - outputs[:, i, :, :])**2
+        if epistemic_unc is None:
+            epistemic_unc = expert_weights[:, i, :, :]*expert_diff
+        else:
+            epistemic_unc += expert_weights[:, i, :, :]*expert_diff
+    return aleatoric_unc, epistemic_unc, aleatoric_unc+epistemic_unc

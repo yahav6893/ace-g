@@ -1229,6 +1229,146 @@ class UncExpertFusionHead(SCRHead):
 
         return mogu_loss
 
+    def compute_mogu_reproj_loss(
+        self,
+        target_pixels: torch.Tensor,
+        w2c_b34: torch.Tensor,
+        image_from_camera_b33: torch.Tensor,
+        depth_min: float = 0.1,
+        depth_max: float = 1000.0,
+        max_reprojection_error: float = 1000.0,
+        var_px_min: float = 1.0,
+        var_px_max: float = 1e6,
+    ) -> torch.Tensor:
+        """Compute MoGU weighted Gaussian NLL in reprojection space.
+
+        This is the 2D-supervised MoGU variant for ACE-style training, where dense
+        target scene coordinates may be unavailable. It must be called after forward().
+
+        Args:
+            target_pixels: Ground-truth patch-center pixels, shape (B*h*w, 2).
+            w2c_b34: World-to-camera transforms for each patch, shape (B*h*w, 3, 4).
+            image_from_camera_b33: Intrinsics for each patch, shape (B*h*w, 3, 3).
+            depth_min: Minimum valid camera depth.
+            depth_max: Maximum valid camera depth.
+            max_reprojection_error: Hard maximum reprojection error for valid expert residuals.
+            var_px_min: Minimum projected variance in px^2 for numerical stability.
+            var_px_max: Maximum projected variance in px^2 for numerical stability.
+
+        Returns:
+            Scalar MoGU reprojection loss.
+        """
+        if self.last_expert_preds is None:
+            raise RuntimeError(
+                "compute_mogu_reproj_loss() called before UncExpertFusionHead.forward()."
+            )
+
+        from ace_g import losses as ace_losses
+
+        preds = self.last_expert_preds.float()       # [B, K, 3, h, w]
+        sigmas = self.last_sq_sigmas.float()         # [B, K, 3, h, w], variance in m^2
+
+        b, k, d, h, w = preds.shape
+        if d != 3:
+            raise ValueError(f"Expected 3D expert predictions, got d={d}.")
+
+        expected_patches = b * h * w
+        if target_pixels.shape[0] != expected_patches:
+            raise ValueError(
+                f"target_pixels has {target_pixels.shape[0]} rows, expected {expected_patches} "
+                f"for expert tensor shape {(b, k, d, h, w)}."
+            )
+
+        target_pixels_bhw2 = target_pixels.view(b, h, w, 2).float()
+        w2c_bhw34 = w2c_b34.view(b, h, w, 3, 4).float()
+        k_bhw33 = image_from_camera_b33.view(b, h, w, 3, 3).float()
+
+        # Project every expert prediction using the same helper as the base reprojection loss.
+        preds_flat = preds.permute(0, 1, 3, 4, 2).reshape(b * k * h * w, 3)
+        w2c_flat = (
+            w2c_bhw34[:, None]
+            .expand(b, k, h, w, 3, 4)
+            .reshape(b * k * h * w, 3, 4)
+        )
+        k_flat = (
+            k_bhw33[:, None]
+            .expand(b, k, h, w, 3, 3)
+            .reshape(b * k * h * w, 3, 3)
+        )
+        target_flat = (
+            target_pixels_bhw2[:, None]
+            .expand(b, k, h, w, 2)
+            .reshape(b * k * h * w, 2)
+        )
+
+        pix_flat, cam_flat, _ = ace_losses.project_scene_coords_to_pixels(
+            pred_coords=preds_flat,
+            w2c_b34=w2c_flat,
+            image_from_camera_b33=k_flat,
+            depth_min=depth_min,
+        )
+
+        pix = pix_flat.view(b, k, h, w, 2)
+        cam = cam_flat.view(b, k, h, w, 3)
+        z = cam[..., 2]
+
+        repro_l1 = torch.linalg.norm(pix_flat - target_flat, ord=1, dim=-1).view(b, k, h, w)
+
+        valid = (
+            torch.isfinite(pix).all(dim=-1)
+            & torch.isfinite(z)
+            & (z > depth_min)
+            & (z < depth_max)
+            & (repro_l1 < max_reprojection_error)
+        )
+
+        # Convert coordinate variance [m^2] to an approximate scalar pixel variance [px^2].
+        # This mirrors the uncertainty projection used by compute_loss(): sigma_px ~= sigma_m * f / z.
+        var_m = sigmas.mean(dim=2).clamp(
+            min=float(self.config.var_min),
+            max=float(self.config.var_max),
+        )
+        fx = k_bhw33[..., 0, 0][:, None]
+        fy = k_bhw33[..., 1, 1][:, None]
+        f = 0.5 * (fx + fy)
+        var_px = var_m * (f / z.clamp(min=depth_min)).pow(2)
+        var_px = var_px.clamp(min=var_px_min, max=var_px_max)
+
+        # MoE weights from projected uncertainty, with invalid experts removed.
+        inv_var = torch.where(
+            valid,
+            1.0 / (var_px + float(self.config.eps)),
+            torch.zeros_like(var_px),
+        )
+        denom = inv_var.sum(dim=1, keepdim=True)
+        valid_any = denom.squeeze(1) > 0
+
+        if not valid_any.any():
+            zero = torch.zeros((), device=preds.device, dtype=preds.dtype)
+            self.last_mogu_loss = zero
+            return zero
+
+        weights = inv_var / denom.clamp_min(float(self.config.eps))  # [B,K,h,w]
+
+        pix_bk2hw = pix.permute(0, 1, 4, 2, 3)
+        target_bk2hw = target_pixels_bhw2.permute(0, 3, 1, 2)[:, None].expand_as(pix_bk2hw)
+        var_bk2hw = var_px[:, :, None].expand_as(pix_bk2hw)
+
+        nll = torch.nn.functional.gaussian_nll_loss(
+            input=pix_bk2hw,
+            target=target_bk2hw,
+            var=var_bk2hw,
+            reduction="none",
+        ).mean(dim=2)  # [B,K,h,w]
+        nll = torch.where(valid, nll, torch.zeros_like(nll))
+
+        loss_hw = (weights * nll).sum(dim=1)
+        loss_mogu = loss_hw[valid_any].mean()
+
+        self.last_mogu_loss = loss_mogu
+        self.last_mogu_reproj_weights = weights.detach()
+        return loss_mogu
+
     def unfreeze_experts_if_needed(self, iteration: int):
         # Keep same API as LateFusionCoordHead, but only applies to MLPHeads.
         # UncHeads are trainable from the beginning.

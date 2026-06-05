@@ -36,8 +36,9 @@ sst:
       head_dropout: 0.0
       var_eps: 1.0e-6
 
-  eps: 1.0e-8
-  return_fused_uncertainty: false
+    eps: 1.0e-8
+    return_fused_uncertainty: false
+
   repro_loss_soft_clamp_min: 5
 
   # --- Encoder: ONE list (vanilla DINOv2, DPTv2) ---

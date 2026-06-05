@@ -114,7 +114,8 @@ def main() -> int:
 
     config_dict = yoco.load_config_from_file(config_path)
 
-    run_name = f"train__{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
+    run_prefix = f"{slugify(args.session_prefix)}__" if args.session_prefix else ""
+    run_name = f"train__{run_prefix}{slugify(model_name)}__{slugify(dataset_name)}__{timestamp_now()}"
     wb_run = maybe_init_wandb(
         enabled=not args.disable_wandb,
         project=args.wandb_project,
@@ -264,7 +265,7 @@ def main() -> int:
         wandb_log_artifact_file(
             wb_run,
             path=status_path,
-            artifact_name=f"train-status__{model_name}__{dataset_name}",
+            artifact_name=f"train-status__{run_prefix}{model_name}__{dataset_name}",
             artifact_type="train-status",
             metadata={
                 "model_name": model_name,

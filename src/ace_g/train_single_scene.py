@@ -552,12 +552,30 @@ class SingleSceneTrainer:
                     "Use UncExpertFusionHead or disable mogu_loss_weight."
                 )
 
-            loss_mogu = self.regressor.head.compute_mogu_loss(target_coords_b3)
+            if hasattr(self.regressor.head, "compute_mogu_reproj_loss"):
+                loss_mogu = self.regressor.head.compute_mogu_reproj_loss(
+                    target_pixels=target_px_b2,
+                    w2c_b34=w2augc_b34,
+                    image_from_camera_b33=image_from_camera_b33,
+                    depth_min=self.config.depth_min,
+                    depth_max=self.config.depth_max,
+                    max_reprojection_error=self.config.repro_loss_hard_clamp,
+                )
+            else:
+                valid_3d_ratio = (target_coords_b3.abs().sum(dim=1) > 1e-5).float().mean()
+                if valid_3d_ratio < 0.95:
+                    raise RuntimeError(
+                        f"Coordinate-space MoGU requested, but only {valid_3d_ratio.item():.3f} "
+                        "of target_coords are valid. Use UncExpertFusionHead.compute_mogu_reproj_loss() "
+                        "or provide dense depth/target coordinates."
+                    )
+                loss_mogu = self.regressor.head.compute_mogu_loss(target_coords_b3)
 
             loss = loss + mogu_loss_weight * loss_mogu
 
-            rr.log("loss_mogu", rr.Scalars(loss_mogu.item()))
-            rr.log("loss_mogu_weighted", rr.Scalars((mogu_loss_weight * loss_mogu).item()))            
+            if self.config.use_rerun:
+                rr.log("loss_mogu", rr.Scalars(loss_mogu.item()))
+                rr.log("loss_mogu_weighted", rr.Scalars((mogu_loss_weight * loss_mogu).item()))
 
         if getattr(self, '_use_wandb', False):
             import wandb
