@@ -916,6 +916,16 @@ class UncExpertFusionHead(SCRHead):
         var_max: float = 100.0
         mogu_loss_weight: float = 1.0
 
+        # Optional uncertainty-derived tau for the existing ReproLoss dyntanh branch.
+        # tau_source controls which uncertainty tensor is used as tau:
+        #   none      -> keep the original scheduled tau(t) from ReproLoss
+        #   aleatoric -> tau from sum_i w_i * sigma_i^2
+        #   total     -> tau from aleatoric + epistemic expert disagreement
+        tau_source: Literal["none", "aleatoric", "total"] = "none"
+        tau_detach: bool = True
+        tau_min_px: float = 1.0
+        tau_max_px: float = 100.0
+
         # Whether to return a fused one-channel uncertainty as u_hat
         return_fused_uncertainty: bool = False
         
@@ -1086,6 +1096,51 @@ class UncExpertFusionHead(SCRHead):
         self.last_sq_sigmas = None
         self.last_moe_weights = None
         self.last_mogu_loss = None
+        self.last_aleatoric_unc = None
+        self.last_epistemic_unc = None
+        self.last_total_unc = None
+        self.last_tau_uncertainty = None
+
+    def calc_aleatoric_epistemic_uncertainty(
+        self,
+        outputs: torch.Tensor,
+        agg_outputs: torch.Tensor,
+        expert_unc: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute aleatoric / epistemic / total uncertainty from expert predictions.
+
+        Args:
+            outputs: Per-expert predictions, shape [B, K, 3, h, w].
+            agg_outputs: Weighted expert output, shape [B, 3, h, w].
+            expert_unc: MoGU uncertainty per expert, shape [B, K, 3, h, w].
+                In this implementation this is variance, i.e. sigma^2, not std.
+            expert_weights: Normalized inverse-uncertainty expert weights,
+                shape [B, K, 3, h, w].
+
+        Returns:
+            aleatoric_unc: sum_i w_i * sigma_i^2, shape [B, 3, h, w].
+            epistemic_unc: sum_i w_i * (mu_i - mu_fused)^2, shape [B, 3, h, w].
+            total_unc: aleatoric_unc + epistemic_unc, shape [B, 3, h, w].
+        """
+        if outputs.ndim != 5:
+            raise ValueError(f"outputs must have shape [B,K,3,h,w], got {tuple(outputs.shape)}")
+        if agg_outputs.ndim != 4:
+            raise ValueError(f"agg_outputs must have shape [B,3,h,w], got {tuple(agg_outputs.shape)}")
+        if expert_unc.shape != outputs.shape:
+            raise ValueError(
+                f"expert_unc shape {tuple(expert_unc.shape)} must match outputs {tuple(outputs.shape)}"
+            )
+        if expert_weights.shape != outputs.shape:
+            raise ValueError(
+                f"expert_weights shape {tuple(expert_weights.shape)} must match outputs {tuple(outputs.shape)}"
+            )
+
+        aleatoric_unc = torch.sum(expert_unc * expert_weights, dim=1)
+        expert_diff = (agg_outputs[:, None] - outputs) ** 2
+        epistemic_unc = torch.sum(expert_weights * expert_diff, dim=1)
+        total_unc = aleatoric_unc + epistemic_unc
+        return aleatoric_unc, epistemic_unc, total_unc
 
     def forward(self, patch_embeddings: torch.Tensor):
         leading_dims = patch_embeddings.shape[:-3]
@@ -1145,6 +1200,14 @@ class UncExpertFusionHead(SCRHead):
         # Weighted coordinate prediction
         y_hat = (weights * preds.float()).sum(dim=1)
 
+        # Uncertainty decomposition used to optionally override the dyntanh tau in ReproLoss.
+        aleatoric_unc, epistemic_unc, total_unc = self.calc_aleatoric_epistemic_uncertainty(
+            outputs=preds.float(),
+            agg_outputs=y_hat.float(),
+            expert_unc=sigmas_safe.float(),
+            expert_weights=weights.float(),
+        )
+
         # Optional fused uncertainty for compatibility
         u_hat = None
         if self.config.return_fused_uncertainty:
@@ -1154,10 +1217,13 @@ class UncExpertFusionHead(SCRHead):
             # Old SCR uncertainty path usually expects [B, 1, h, w]
             u_hat = sq_sigma_hat.mean(dim=1, keepdim=True)
 
-        # Save tensors for MoGU loss
+        # Save tensors for MoGU loss / tau override.
         self.last_expert_preds = preds
         self.last_sq_sigmas = sigmas_safe
         self.last_moe_weights = weights
+        self.last_aleatoric_unc = aleatoric_unc
+        self.last_epistemic_unc = epistemic_unc
+        self.last_total_unc = total_unc
 
         # Reshape back to leading dims
         d = y_hat.shape[1]

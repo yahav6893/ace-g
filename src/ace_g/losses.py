@@ -70,6 +70,9 @@ def compute_loss(
     loss_fn_2d: ReproLoss | str | None = None,
     loss_fn_3d: ReproLoss | str | None = None,
     iteration: int | None = None,
+    loss_tau_uncertainty: torch.Tensor | None = None,
+    loss_tau_min_px: float = 1.0,
+    loss_tau_max_px: float = 100.0,
 ) -> tuple:
     """Compute loss from predicted scene coordinates and target pixels or target scene coordinates.
 
@@ -216,12 +219,41 @@ def compute_loss(
 
         losses_2d_b = torch.zeros_like(all_distances_2d)
         valid_distances_2d = all_distances_2d[valid_mask_b]
+
+        # Optional uncertainty-derived tau override for ReproLoss.
+        # loss_tau_uncertainty is expected to be the selected uncertainty tensor from
+        # UncExpertFusionHead, aligned with pred_coords, and expressed as coordinate variance [m^2].
+        # Convert to pixel std before passing it as tau to ReproLoss.compute():
+        #     tau_px ~= sqrt(var_m) * focal_px / depth_m
+        loss_tau_2d = None
+        if loss_tau_uncertainty is not None:
+            if loss_tau_uncertainty.shape != pred_coords.shape:
+                raise ValueError(
+                    f"loss_tau_uncertainty must match pred_coords shape {tuple(pred_coords.shape)}, "
+                    f"got {tuple(loss_tau_uncertainty.shape)}"
+                )
+            tau_m = torch.sqrt(loss_tau_uncertainty.float().clamp_min(1e-12)).mean(dim=-1)
+            focal = 0.5 * (
+                image_from_camera_b33[..., 0, 0].float()
+                + image_from_camera_b33[..., 1, 1].float()
+            )
+            depth = pred_coords_c_b3[..., 2].float().clamp_min(float(depth_min))
+            loss_tau_2d = tau_m * focal / depth
+            loss_tau_2d = loss_tau_2d.clamp(
+                min=float(loss_tau_min_px),
+                max=float(loss_tau_max_px),
+            ).to(dtype=valid_distances_2d.dtype, device=valid_distances_2d.device)
+
         all_distances_2d = all_distances_2d.flatten()
 
         if valid_mask_b.any():
             if pred_uncertainties is None:
                 if isinstance(loss_fn_2d, ReproLoss):
-                    losses_2d_b[valid_mask_b] = loss_fn_2d.compute(valid_distances_2d, iteration)
+                    losses_2d_b[valid_mask_b] = loss_fn_2d.compute(
+                        valid_distances_2d,
+                        iteration,
+                        tau_override=loss_tau_2d[valid_mask_b] if loss_tau_2d is not None else None,
+                    )
                 elif isinstance(loss_fn_2d, str):
                     losses_2d_b[valid_mask_b] = eval_loss(loss_fn_2d, valid_distances_2d)
                 else:
@@ -246,7 +278,7 @@ def compute_loss(
 
             if depth_prior_mask.any():
                 assert target_coords is not None, "Target coordinates are required for depth prior"
-                distances_to_prior = torch.linalg.norm(pred_coords_c_b31.squeeze(-1) - target_coords, dim=-1)
+                distances_to_prior = torch.linalg.norm(pred_coords - target_coords, dim=-1)
                 losses_2d_b[depth_prior_mask] = distances_to_prior[depth_prior_mask]
 
             if const_depth_prior_mask.any():
@@ -349,7 +381,7 @@ def log_metrics(
         pass
 
 
-def weighted_tanh(repro_errs: torch.Tensor, weight: float) -> torch.Tensor:
+def weighted_tanh(repro_errs: torch.Tensor, weight: float | torch.Tensor) -> torch.Tensor:
     """Compute weighted tanh.
 
     Args:
@@ -390,7 +422,12 @@ class ReproLoss:
         self.type = type
         self.circle_schedule = circle_schedule
 
-    def compute(self, errors: torch.Tensor, iteration: int) -> torch.Tensor:
+    def compute(
+        self,
+        errors: torch.Tensor,
+        iteration: int,
+        tau_override: torch.Tensor | float | None = None,
+    ) -> torch.Tensor:
         """Compute the reprojection loss based on the specified type of loss function.
 
         The types of loss function available are: 'tanh', 'dyntanh', 'l1', 'l1+sqrt', and 'l1+logl1'.
@@ -411,6 +448,18 @@ class ReproLoss:
 
         # Compute the dynamic tanh loss
         elif self.type == "dyntanh":
+            if tau_override is not None:
+                # tau_override replaces the scheduled loss_weight = tau(t).
+                # It must be aligned with errors and expressed in the same unit: pixels.
+                tau = torch.as_tensor(tau_override, device=errors.device, dtype=errors.dtype)
+                if tau.numel() != 1 and tau.shape != errors.shape:
+                    raise ValueError(
+                        f"tau_override must be scalar or match errors shape {tuple(errors.shape)}, "
+                        f"got {tuple(tau.shape)}"
+                    )
+                tau = tau.clamp_min(1e-6)
+                return weighted_tanh(errors, tau)
+
             # Compute the progress over the training process.
             schedule_weight = iteration / self.total_iterations
 
@@ -418,25 +467,31 @@ class ReproLoss:
             if self.circle_schedule:
                 schedule_weight = 1 - np.sqrt(1 - schedule_weight**2)
 
-            # Compute the weight to use in the tanh loss.
+            # Compute the weight to use in the tanh loss. This is tau(t).
             loss_weight = (1 - schedule_weight) * self.soft_clamp + self.soft_clamp_min
 
             # Compute actual loss.
             return weighted_tanh(errors, loss_weight)
 
-                # Compute the dynamic tanh loss
+        # Compute uncertainty-driven tanh loss. Same math as dyntanh, but meant for tau_override experiments.
         elif self.type == "unc_tanh":
-            # Compute the progress over the training process.
+            if tau_override is not None:
+                tau = torch.as_tensor(tau_override, device=errors.device, dtype=errors.dtype)
+                if tau.numel() != 1 and tau.shape != errors.shape:
+                    raise ValueError(
+                        f"tau_override must be scalar or match errors shape {tuple(errors.shape)}, "
+                        f"got {tuple(tau.shape)}"
+                    )
+                tau = tau.clamp_min(1e-6)
+                return weighted_tanh(errors, tau)
+
             schedule_weight = iteration / self.total_iterations
 
-            # Optionally scale it using the circular schedule.
             if self.circle_schedule:
                 schedule_weight = 1 - np.sqrt(1 - schedule_weight**2)
 
-            # Compute the weight to use in the tanh loss.
             loss_weight = (1 - schedule_weight) * self.soft_clamp + self.soft_clamp_min
 
-            # Compute actual loss.
             return weighted_tanh(errors, loss_weight)
 
         # Compute the L1 loss

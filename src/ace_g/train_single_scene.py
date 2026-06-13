@@ -498,6 +498,35 @@ class SingleSceneTrainer:
             else None
         )
 
+        # Optional MoGU uncertainty -> tau override for the existing ReproLoss path.
+        # The head computes aleatoric / epistemic / total uncertainty during forward();
+        # here we only select one source and flatten it to match pred_coords_w_b3.
+        head_cfg = getattr(self.regressor.head, "config", None)
+        tau_source = str(getattr(head_cfg, "tau_source", "none"))
+        loss_tau_uncertainty_b3 = None
+
+        if tau_source != "none":
+            if tau_source == "aleatoric":
+                tau_n3hw = getattr(self.regressor.head, "last_aleatoric_unc", None)
+            elif tau_source == "total":
+                tau_n3hw = getattr(self.regressor.head, "last_total_unc", None)
+            else:
+                raise ValueError(
+                    f"Unsupported tau_source={tau_source!r}. Expected one of: none, aleatoric, total."
+                )
+
+            if tau_n3hw is None:
+                raise RuntimeError(
+                    f"tau_source={tau_source!r} requested, but the head did not populate the corresponding "
+                    "uncertainty tensor. Use UncExpertFusionHead."
+                )
+
+            if bool(getattr(head_cfg, "tau_detach", True)):
+                tau_n3hw = tau_n3hw.detach()
+
+            loss_tau_uncertainty_b3 = tau_n3hw.permute(0, 2, 3, 1).flatten(0, 2).float()
+            self.regressor.head.last_tau_uncertainty = loss_tau_uncertainty_b3
+
         if self.config.use_rerun:
             pred_coords_w_b3_np = pred_coords_w_b3.numpy(force=True)
 
@@ -533,6 +562,9 @@ class SingleSceneTrainer:
             loss_fn_2d=self.loss_fn_2d,
             loss_fn_3d=self.config.loss_fn_3d,
             iteration=self.iteration,
+            loss_tau_uncertainty=loss_tau_uncertainty_b3,
+            loss_tau_min_px=float(getattr(head_cfg, "tau_min_px", 1.0)),
+            loss_tau_max_px=float(getattr(head_cfg, "tau_max_px", 100.0)),
         )
 
         losses.log_metrics(loss, losses_3d, losses_2d, dists_3d, dists_2d)
@@ -542,10 +574,14 @@ class SingleSceneTrainer:
             if self.config.use_rerun:
                 rr.log("loss_l2_reg", rr.Scalars(self.regressor.head.last_l2_reg_loss.item()))
 
-        head_cfg = getattr(self.regressor.head, "config", None)
+        # If tau_source is active, MoGU is already fused into the main 2D loss by replacing tau(t).
+        # Do not add the older auxiliary coordinate/reprojection MoGU loss on top unless tau_source='none'.
         mogu_loss_weight = float(getattr(head_cfg, "mogu_loss_weight", 0.0))
 
-        if mogu_loss_weight > 0.0:
+        if loss_tau_uncertainty_b3 is not None and hasattr(self.regressor.head, "last_mogu_loss"):
+            self.regressor.head.last_mogu_loss = None
+
+        if mogu_loss_weight > 0.0 and loss_tau_uncertainty_b3 is None:
             if not hasattr(self.regressor.head, "compute_mogu_loss"):
                 raise RuntimeError(
                     "mogu_loss_weight > 0, but head has no compute_mogu_loss(). "
@@ -618,6 +654,14 @@ class SingleSceneTrainer:
             )
 
             # write the main information to the log file
+            if loss_tau_uncertainty_b3 is not None:
+                tau_valid = torch.isfinite(loss_tau_uncertainty_b3).all(dim=1)
+                if tau_valid.any():
+                    _logger.info(
+                        f"Tau source: {tau_source}, "
+                        f"mean selected uncertainty: {loss_tau_uncertainty_b3[tau_valid].mean().item():.4g}"
+                    )
+
             log_str = f"{self.iteration} {time_since_start} {loss}"
 
             self.log_file.write(log_str + "\n")
