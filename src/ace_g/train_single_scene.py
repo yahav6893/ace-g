@@ -575,13 +575,13 @@ class SingleSceneTrainer:
                 rr.log("loss_l2_reg", rr.Scalars(self.regressor.head.last_l2_reg_loss.item()))
 
         # If tau_source is active, MoGU is already fused into the main 2D loss by replacing tau(t).
-        # Do not add the older auxiliary coordinate/reprojection MoGU loss on top unless tau_source='none'.
+        # Optional auxiliary MoGU loss.
+        # This is controlled only by mogu_loss_weight.
+        # It can be used together with tau_source; set mogu_loss_weight=0 to disable it.        
+        loss_mogu = None
         mogu_loss_weight = float(getattr(head_cfg, "mogu_loss_weight", 0.0))
 
-        if loss_tau_uncertainty_b3 is not None and hasattr(self.regressor.head, "last_mogu_loss"):
-            self.regressor.head.last_mogu_loss = None
-
-        if mogu_loss_weight > 0.0 and loss_tau_uncertainty_b3 is None:
+        if mogu_loss_weight > 0.0:
             if not hasattr(self.regressor.head, "compute_mogu_loss"):
                 raise RuntimeError(
                     "mogu_loss_weight > 0, but head has no compute_mogu_loss(). "
@@ -602,16 +602,25 @@ class SingleSceneTrainer:
                 if valid_3d_ratio < 0.95:
                     raise RuntimeError(
                         f"Coordinate-space MoGU requested, but only {valid_3d_ratio.item():.3f} "
-                        "of target_coords are valid. Use UncExpertFusionHead.compute_mogu_reproj_loss() "
+                        "of target_coords are valid. Use compute_mogu_reproj_loss() "
                         "or provide dense depth/target coordinates."
                     )
                 loss_mogu = self.regressor.head.compute_mogu_loss(target_coords_b3)
 
-            loss = loss + mogu_loss_weight * loss_mogu
-
             if self.config.use_rerun:
                 rr.log("loss_mogu", rr.Scalars(loss_mogu.item()))
                 rr.log("loss_mogu_weighted", rr.Scalars((mogu_loss_weight * loss_mogu).item()))
+
+            if not torch.isfinite(loss_mogu):
+                _logger.warning(f"Non-finite MoGU loss at iter={self.iteration}: {loss_mogu}")
+                self.training_scheduler.zero_grad(set_to_none=True)
+                return
+
+            loss = loss + mogu_loss_weight * loss_mogu
+            self.regressor.head.last_mogu_loss = loss_mogu.detach()
+        else:
+            if hasattr(self.regressor.head, "last_mogu_loss"):
+                self.regressor.head.last_mogu_loss = None
 
         if getattr(self, '_use_wandb', False):
             import wandb
@@ -628,8 +637,10 @@ class SingleSceneTrainer:
             if wb_log_dict:
                 wandb.log(wb_log_dict, commit=False)
 
-        if torch.any(torch.isnan(loss)):
-            _logger.info("nan loss detected (step skipped)")
+        if not torch.isfinite(loss).all():
+            _logger.warning(f"Non-finite or NaN loss detected at iter={self.iteration}: {loss}. Step skipped.")
+            self.training_scheduler.zero_grad(set_to_none=True)
+            return
 
         # Set gradient buffers to zero
         self.training_scheduler.zero_grad(set_to_none=True)

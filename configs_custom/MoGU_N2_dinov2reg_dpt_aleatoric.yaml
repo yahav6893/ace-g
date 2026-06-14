@@ -12,7 +12,7 @@ sst:
     expert_head_paths:
       - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
       - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
-    freeze_loaded_experts: true
+    freeze_loaded_experts: false
     force_shared_mean: true   # recommended unless you verified both heads have identical mean
 
     expert_head:
@@ -25,13 +25,13 @@ sst:
       use_uncertainty: false
 
     # MoGU uncertainty is used through tau_source below, not as an extra auxiliary loss.
-    mogu_loss_weight: 0.0
+    mogu_loss_weight: 1.0
     var_min: 1e-1
     var_max: 100.0
 
     # Use MoGU uncertainty as tau in the existing ReproLoss dyntanh branch.
     # Options: none, aleatoric, total.
-    tau_source: aleatoric
+    tau_source: total
     tau_detach: true
     tau_min_px: 1.0
     tau_max_px: 100.0
@@ -46,6 +46,14 @@ sst:
 
     eps: 1.0e-8
     return_fused_uncertainty: false
+
+    # Custom absolute learning rates for experts and uncertainty heads
+    # (Optional: uncomment/configure to override base scheduler's learning rate)
+    # expert_learning_rate_min: 0.00005
+    # expert_learning_rate_max: 0.0005
+    # unc_learning_rate_min: 0.0001
+    # unc_learning_rate_max: 0.001
+    # unfreeze_experts_after_iterations: 5000
 
   repro_loss_soft_clamp_min: 5
 

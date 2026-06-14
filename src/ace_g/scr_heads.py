@@ -932,6 +932,13 @@ class UncExpertFusionHead(SCRHead):
         # Sanity check: force a specific expert
         sanity_check_force_expert: int | None = None
 
+        # Separate learning rate settings (absolute values)
+        expert_learning_rate_min: float | None = None
+        expert_learning_rate_max: float | None = None
+        unc_learning_rate_min: float | None = None
+        unc_learning_rate_max: float | None = None
+        unfreeze_experts_after_iterations: int = -1
+
         # SCRHead base knobs
         mean: torch.Tensor | None = None
         use_homogeneous: bool = True
@@ -1438,9 +1445,20 @@ class UncExpertFusionHead(SCRHead):
     def unfreeze_experts_if_needed(self, iteration: int):
         # Keep same API as LateFusionCoordHead, but only applies to MLPHeads.
         # UncHeads are trainable from the beginning.
-        return
+        target_iter = getattr(self.config, 'unfreeze_experts_after_iterations', -1)
+        if target_iter > 0 and iteration == target_iter:
+            _logger.info(f"Unfreezing expert heads at iteration {iteration}")
+            for expert in self.experts:
+                for prm in expert.mlp_head.parameters():
+                    prm.requires_grad_(True)
 
     def get_param_groups(self, min_lr: float, max_lr: float) -> list[dict]:
+        expert_min = self.config.expert_learning_rate_min if self.config.expert_learning_rate_min is not None else min_lr
+        expert_max = self.config.expert_learning_rate_max if self.config.expert_learning_rate_max is not None else max_lr
+        
+        unc_min = self.config.unc_learning_rate_min if self.config.unc_learning_rate_min is not None else min_lr
+        unc_max = self.config.unc_learning_rate_max if self.config.unc_learning_rate_max is not None else max_lr
+
         groups = []
 
         mlp_params = []
@@ -1454,18 +1472,18 @@ class UncExpertFusionHead(SCRHead):
             groups.append({
                 "name": "mlp_experts",
                 "params": mlp_params,
-                "lr": max_lr,
-                "max_lr": max_lr,
-                "min_lr": min_lr,
+                "lr": expert_max,
+                "max_lr": expert_max,
+                "min_lr": expert_min,
             })
 
         if unc_params:
             groups.append({
                 "name": "unc_heads",
                 "params": unc_params,
-                "lr": max_lr,
-                "max_lr": max_lr,
-                "min_lr": min_lr,
+                "lr": unc_max,
+                "max_lr": unc_max,
+                "min_lr": unc_min,
             })
 
         handled = set(id(p) for p in mlp_params + unc_params)

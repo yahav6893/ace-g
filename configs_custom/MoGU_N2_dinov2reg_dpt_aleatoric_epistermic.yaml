@@ -25,7 +25,7 @@ sst:
       use_uncertainty: false
 
     # MoGU uncertainty is used through tau_source below, not as an extra auxiliary loss.
-    mogu_loss_weight: 1.0
+    mogu_loss_weight: 0.01
     var_min: 1e-1
     var_max: 100.0
 
@@ -46,6 +46,14 @@ sst:
 
     eps: 1.0e-8
     return_fused_uncertainty: false
+
+    # Custom absolute learning rates for experts and uncertainty heads
+    # (Optional: uncomment/configure to override base scheduler's learning rate)
+    expert_learning_rate_min: 0.0000001
+    expert_learning_rate_max: 0.000005
+    unc_learning_rate_min: 0.00001
+    unc_learning_rate_max: 0.0005
+    unfreeze_experts_after_iterations: -1
 
   repro_loss_soft_clamp_min: 5
 
