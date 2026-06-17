@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
 
     p.add_argument("--repo-root", default="~/dace/ace-g", help="ACE-G repo root")
-    p.add_argument("--dataset-root", default="~/dace/data/ace_datasets/TODO_DATASET_NAME", help="Dataset root containing scene directories")
+    p.add_argument("--dataset-root", default="~/dace/datasets/cambridge", help="Dataset root containing scene directories")
     p.add_argument("--output-root", default="~/dace/outputs", help="Output root for logs, status, promoted artifacts")
     p.add_argument("--cache-root", default="~/dace/cache/ace_cache", help="Cache root placeholder for your server cache tree")
     p.add_argument("--torch-home", default="~/dace/cache/ace_cache/torch", help="TORCH_HOME for subprocesses")

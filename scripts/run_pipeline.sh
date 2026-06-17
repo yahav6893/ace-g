@@ -4,7 +4,7 @@ set -euo pipefail
 # Default configuration parameters (overrideable via environment variables)
 REPO_ROOT="${REPO_ROOT:-${HOME}/dace/ace-g}"
 DATASET_ROOT="${DATASET_ROOT:-${HOME}/dace/datasets/cambridge}"
-CONFIG_NAME="${CONFIG_NAME:-MoGU_N2_dinov2reg_dpt_aleatoric_epistermic.yaml}"
+CONFIG_NAME="${CONFIG_NAME:-MoGU_N2_frozen_total_tau0_scalar_unc.yaml}"
 #SCENES="${SCENES:-shopfacade kingscollege oldhospital stmaryschurch greatcourt}"
 SCENES="${SCENES:-shopfacade}"
 

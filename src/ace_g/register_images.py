@@ -24,7 +24,7 @@ import yoco
 from torch.utils.data import DataLoader
 
 import dsacstar
-from ace_g import configuration, data_io, datasets, encoders, eval_poses_utils, regressors, scr_heads, utils
+from ace_g import configuration, data_io, datasets, encoders, eval_poses, eval_poses_utils, regressors, scr_heads, utils
 
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa: E402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa: E402
@@ -100,6 +100,46 @@ class RegistrationConfig(configuration.GlobalConfig):
     rr_prefix: str = ""
     """Added to all rerun entity paths (can be useful for merging rrd files)."""
 
+    # Expert-fusion diagnostics / ablation.
+    sanity_check_force_expert: int | None = None
+    """If set, force UncExpertFusionHead to use this expert index during registration.
+
+    None keeps normal fused inference. 0 forces expert 0, 1 forces expert 1, etc.
+    This is an evaluation-only override and does not modify the checkpoint.
+    """
+    append_registration_mode_to_session_id: bool = True
+    """Append '_fused' or '_expert{i}' to session IDs to avoid overwriting outputs."""
+    eval_after_register: bool = False
+    """Run pose evaluation immediately after registration using dataset.pose_files as ground truth."""
+    eval_metric_prefix: str | None = None
+    """W&B prefix for on-the-spot eval metrics. If None, defaults to eval/fused or eval/expert{i}."""
+
+
+
+def _registration_mode_name(force_expert: int | None) -> str:
+    """Return a stable label for the registration variant."""
+    return "fused" if force_expert is None else f"expert{int(force_expert)}"
+
+
+def _apply_force_expert_override(head: torch.nn.Module, force_expert: int | None) -> None:
+    """Force a specific UncExpertFusionHead expert for registration-time ablations."""
+    if force_expert is None:
+        return
+
+    if not hasattr(head, "config") or not hasattr(head.config, "sanity_check_force_expert"):
+        raise RuntimeError(
+            "sanity_check_force_expert was requested, but the loaded head does not expose "
+            "config.sanity_check_force_expert. Expected UncExpertFusionHead."
+        )
+
+    num_experts = getattr(head.config, "num_experts", None)
+    if num_experts is not None and not (0 <= int(force_expert) < int(num_experts)):
+        raise ValueError(
+            f"Requested sanity_check_force_expert={force_expert}, but head has num_experts={num_experts}."
+        )
+
+    head.config.sanity_check_force_expert = int(force_expert)
+    _logger.info(f"Registration override active: forcing expert {int(force_expert)}.")
 
 def register_images(
     config: RegistrationConfig,
@@ -139,6 +179,8 @@ def register_images(
         # Create regressor.
         regressor = regressors.Regressor(encoder, head)
         regressor = regressor.to(config.device)
+
+    _apply_force_expert_override(regressor.head, config.sanity_check_force_expert)
 
     # Load map embeddings if specified
     if config.map_path is not None:
@@ -183,6 +225,10 @@ def register_images(
             regressor.encoder.__class__.__name__,
             regressor.head.__class__.__name__,
         )
+
+    registration_mode = _registration_mode_name(config.sanity_check_force_expert)
+    if config.append_registration_mode_to_session_id and not session_id.endswith(f"_{registration_mode}"):
+        session_id = f"{session_id}_{registration_mode}"
 
     # Set subsample factor for the dataset
     dataset.set_subsample_factor(regressor.subsample_factor)
@@ -332,11 +378,50 @@ def register_images(
         },
     }
 
-    # Write to yaml file
+    estimates_dict = {est.image_file: (est.pose_c2w_est, est.confidence) for est in ace_estimates}
+
+    # Optional on-the-spot evaluation. This gives immediate fused/expert pose metrics from the same registration run.
+    if config.eval_after_register:
+        if config.dataset.pose_files is None:
+            raise RuntimeError(
+                "eval_after_register=True requires config.dataset.pose_files to point to ground-truth pose files."
+            )
+
+        metric_prefix = config.eval_metric_prefix
+        if metric_prefix is None:
+            metric_prefix = f"eval/{registration_mode}"
+
+        eval_config = eval_poses.EvaluationConfig(
+            sst=config.sst,
+            reg=utils.primitive(configuration.asdict(config, remove_global_config=True)),
+            ace_pose_file=pose_log_file,
+            gt_pose_files=config.dataset.pose_files,
+            include_intervals=config.dataset.include_intervals,
+            test_run=config.test_run,
+            session_id=session_id,
+            output_dir=config.output_dir,
+            wandb_metric_prefix=metric_prefix,
+        )
+
+        metric_dict, eval_out_dict = eval_poses.eval_poses(
+            eval_config,
+            estimates=estimates_dict,
+        )
+
+        out_dict["eva"] = eval_out_dict.get("eva", out_dict["eva"])
+        out_dict["res"] = {registration_mode: metric_dict}
+
+        _logger.info(
+            f"On-the-spot eval [{registration_mode}]: "
+            f"median_error_cm={metric_dict.get('median_error_cm'):.3f}, "
+            f"median_error_deg={metric_dict.get('median_error_deg'):.3f}"
+        )
+
+    # Write to yaml file after optional eval, so the registration yaml also contains res when available.
     output_file = config.output_dir / f"{session_id}_reg.yaml"
     utils.save_yaml(utils.primitive(out_dict), output_file)
 
-    return {est.image_file: (est.pose_c2w_est, est.confidence) for est in ace_estimates}, out_dict
+    return estimates_dict, out_dict
 
 
 if __name__ == "__main__":

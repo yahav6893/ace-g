@@ -1,0 +1,6 @@
+# Override to evaluate the same checkpoint while forcing expert 0 only.
+reg:
+  sanity_check_force_expert: 0
+  append_registration_mode_to_session_id: true
+  eval_after_register: true
+  eval_metric_prefix: eval/expert0

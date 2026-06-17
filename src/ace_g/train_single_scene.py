@@ -244,9 +244,18 @@ class SingleSceneTrainer:
             self.map_embeddings = None
             self.mean = None
 
-        # Set requires_grad for all parameters
+        # Set requires_grad for all parameters.
+        # Some composite heads freeze loaded submodules during construction.
+        # The global head.requires_grad_(train_head) call would otherwise undo
+        # that freeze, so immediately re-apply and assert the head-specific policy.
         self.regressor.encoder.requires_grad_(False)
         self.regressor.head.requires_grad_(self.config.train_head)
+        if hasattr(self.regressor.head, "apply_freeze_policy"):
+            self.regressor.head.apply_freeze_policy()
+        if hasattr(self.regressor.head, "assert_freeze_policy"):
+            self.regressor.head.assert_freeze_policy()
+        if hasattr(self.regressor.head, "get_freeze_diagnostics"):
+            _logger.info(f"Head freeze diagnostics: {self.regressor.head.get_freeze_diagnostics()}")
         if self.map_embeddings is not None:
             self.map_embeddings.requires_grad_(self.config.train_map_embs)
 

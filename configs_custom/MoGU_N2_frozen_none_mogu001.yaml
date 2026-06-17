@@ -1,0 +1,69 @@
+sst:
+  output_dir: ~/dace/outputs
+  num_iterations: 25000
+  train_head: true
+  head:
+    obj_type: ace_g.scr_heads.UncExpertFusionHead
+    dim_in: 2048
+    num_experts: 2
+    expert_head_paths:
+    - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
+    - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
+    freeze_loaded_experts: true
+    force_shared_mean: false
+    expert_head:
+      obj_type: ace_g.scr_heads.MLPHead
+      dim_in: 1024
+      num_blocks: 1
+      use_homogeneous: true
+      homogeneous_min_scale: 0.01
+      homogeneous_max_scale: 4.0
+      use_uncertainty: false
+    mogu_loss_weight: 0.01
+    var_min: 1e-1
+    var_max: 100.0
+    tau_source: none
+    tau_detach: true
+    tau_min_px: 1.0
+    tau_max_px: 100.0
+    unc_head:
+      dim_in: 1024
+      out_dim: 3
+      arc_type: mlp
+      hidden_ratio: 1.0
+      head_dropout: 0.0
+      var_eps: 1.0e-06
+    eps: 1.0e-08
+    return_fused_uncertainty: false
+    expert_learning_rate_min: 1.0e-07
+    expert_learning_rate_max: 5.0e-06
+    unc_learning_rate_min: 1.0e-05
+    unc_learning_rate_max: 0.0005
+    unfreeze_experts_after_iterations: -1
+  repro_loss_soft_clamp_min: 5
+  encoder:
+    obj_type: ace_g.encoders.ListMultiEncoder
+    kwargs:
+      encoders:
+      - obj_type: ace_g.encoders.DINOv2Encoder
+        kwargs:
+          model_name: dinov2_vitl14_reg
+        path: null
+      - obj_type: ace_g.encoders.DPTv2Encoder
+        kwargs:
+          model_name: vitl
+          checkpoint: /home/eng/vinokuy2/dace/cache/depth_anything/depth_anything_v2_vitl.pth
+        path: null
+    path: null
+  max_buffer_size: 4000000
+  schedule_config:
+    learning_rate_min: 5.0e-05
+    learning_rate_max: 0.0005
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true
+_note: 'Control candidate: frozen experts, no shared-mean overwrite, scheduled dyntanh
+  tau, small auxiliary MoGU reprojection loss.'

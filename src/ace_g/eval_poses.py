@@ -55,6 +55,8 @@ class EvaluationConfig(configuration.GlobalConfig):
     """Custom session name used to generate output files; generated from pose file if not set."""
     output_dir: pathlib.Path = pathlib.Path("./outputs")
     """Target output dir for the trained network and / or map embeddings."""
+    wandb_metric_prefix: str = "eval"
+    """Prefix used when logging metrics to W&B, e.g. 'eval/fused' or 'eval/expert0'."""
 
 
 def eval_poses(
@@ -209,8 +211,8 @@ def eval_poses(
     tErrs.sort()
     rErrs.sort()
     median_idx = total_frames // 2
-    median_rErr = rErrs[median_idx].item()
-    median_tErr = tErrs[median_idx]
+    median_rErr = float(rErrs[median_idx])
+    median_tErr = float(tErrs[median_idx])
 
     # Compute final accuracy.
     for r_thresh, t_thresh in zip(config.pose_error_thresh_r, config.pose_error_thresh_t):
@@ -241,7 +243,7 @@ def eval_poses(
         for r_thresh, t_thresh in zip(config.pose_error_thresh_r, config.pose_error_thresh_t):
             accuracy = deg_cm_to_accuracy[r_thresh, t_thresh]
             f.write(
-                f"Accuracy ({config.pose_error_thresh_r}deg, {config.pose_error_thresh_t * 100}cm): {accuracy:.1f}%\n"
+                f"Accuracy ({r_thresh}deg, {t_thresh * 100}cm): {accuracy:.1f}%\n"
             )
         f.write(f"Median Error: {median_rErr:.1f}deg, {median_tErr:.1f}cm\n")
 
@@ -268,7 +270,8 @@ def eval_poses(
         import wandb
         if getattr(wandb, "run", None) is None:
             wandb.init(resume="allow")
-        wandb.log({f"eval/{k}": v for k, v in metric_dict.items()})
+        metric_prefix = str(getattr(config, "wandb_metric_prefix", "eval")).strip("/")
+        wandb.log({f"{metric_prefix}/{k}": v for k, v in metric_dict.items()})
 
     return metric_dict, out_dict
 

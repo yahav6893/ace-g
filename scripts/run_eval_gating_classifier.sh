@@ -50,7 +50,7 @@ for SCENE in $SCENES; do
     exit 1
   fi
 
-  python "${REPO_ROOT}/scripts/eval_gating_classifier_no_alpha_bins.py" \
+  python "${REPO_ROOT}/scripts/eval_gating_classifier.py" \
     --model0 "${MODEL0}" \
     --model1 "${MODEL1}" \
     --gating_head "${GATING_HEAD}" \

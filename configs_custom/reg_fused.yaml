@@ -1,0 +1,11 @@
+# Override for normal fused MoGU output.
+# Combine with a base registration config/map yaml that contains:
+#   reg.head_path
+#   reg.map_path, if needed
+#   reg.dataset.rgb_files
+#   reg.dataset.pose_files  # required for immediate eval
+reg:
+  sanity_check_force_expert: null
+  append_registration_mode_to_session_id: true
+  eval_after_register: true
+  eval_metric_prefix: eval/fused

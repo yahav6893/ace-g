@@ -617,6 +617,12 @@ class LateFusionCoordHead(SCRHead):
             nn.Conv2d(gate_hidden, self.config.num_experts, kernel_size=1, bias=True),
         )
 
+        # Track which coordinate experts were loaded from checkpoints.
+        # This lets the trainer re-apply the freeze policy after any global
+        # requires_grad_(...) calls without accidentally freezing randomly
+        # initialized experts.
+        self._loaded_expert_indices: set[int] = set()
+
         # -------------------------
         # Optional: load pretrained expert heads + freeze them
         # -------------------------
@@ -646,6 +652,7 @@ class LateFusionCoordHead(SCRHead):
 
                 # Replace the randomly initialized expert with the loaded one.
                 self.expert_heads[i] = loaded
+                self._loaded_expert_indices.add(i)
 
                 # Freeze loaded expert if requested
                 if self.config.freeze_loaded_experts:
@@ -732,6 +739,54 @@ class LateFusionCoordHead(SCRHead):
 
         return y_hat, u_hat
 
+    def apply_freeze_policy(self) -> None:
+        """Freeze loaded coordinate experts if requested.
+
+        This must be safe to call more than once. The trainer calls
+        head.requires_grad_(train_head) globally, which would otherwise undo
+        the freeze performed during __init__().
+        """
+        if not bool(getattr(self.config, "freeze_loaded_experts", False)):
+            return
+
+        for idx in getattr(self, "_loaded_expert_indices", set()):
+            for prm in self.expert_heads[idx].parameters():
+                prm.requires_grad_(False)
+
+    def assert_freeze_policy(self) -> None:
+        """Fail fast if loaded experts are supposed to be frozen but are trainable."""
+        if not bool(getattr(self.config, "freeze_loaded_experts", False)):
+            return
+
+        offenders = []
+        for idx in getattr(self, "_loaded_expert_indices", set()):
+            for name, prm in self.expert_heads[idx].named_parameters():
+                if prm.requires_grad:
+                    offenders.append(f"expert_heads.{idx}.{name}")
+
+        if offenders:
+            shown = ", ".join(offenders[:10])
+            raise RuntimeError(
+                "freeze_loaded_experts=True, but loaded experts are trainable. "
+                f"Examples: {shown}"
+            )
+
+    def get_freeze_diagnostics(self) -> dict[str, int]:
+        """Return parameter counts for quick logging / verification."""
+        loaded = getattr(self, "_loaded_expert_indices", set())
+        loaded_total = 0
+        loaded_trainable = 0
+        for idx in loaded:
+            for prm in self.expert_heads[idx].parameters():
+                n = prm.numel()
+                loaded_total += n
+                if prm.requires_grad:
+                    loaded_trainable += n
+        return {
+            "loaded_expert_param_count": int(loaded_total),
+            "loaded_expert_trainable_param_count": int(loaded_trainable),
+        }
+
     def unfreeze_experts_if_needed(self, iteration: int):
         target_iter = getattr(self.config, 'unfreeze_experts_after_iterations', -1)
         if target_iter > 0 and iteration == target_iter:
@@ -754,7 +809,12 @@ class LateFusionCoordHead(SCRHead):
                 "min_lr": min_lr * gate_factor,
             })
 
-        expert_params = list(self.expert_heads.parameters())
+        # If experts are frozen forever, keep them out of the optimizer.
+        # If scheduled unfreezing is requested, keep them in the optimizer group
+        # while requires_grad=False; they will start receiving gradients only after unfreeze.
+        unfreeze_iter = int(getattr(self.config, 'unfreeze_experts_after_iterations', -1))
+        all_expert_params = list(self.expert_heads.parameters())
+        expert_params = all_expert_params if unfreeze_iter > 0 else [p for p in all_expert_params if p.requires_grad]
         if expert_params:
             groups.append({
                 "name": "experts",
@@ -764,8 +824,8 @@ class LateFusionCoordHead(SCRHead):
                 "min_lr": min_lr * expert_factor,
             })
 
-        handled = set(id(p) for p in gate_params + expert_params)
-        other_params = [p for p in self.parameters() if id(p) not in handled]
+        handled = set(id(p) for p in gate_params + all_expert_params)
+        other_params = [p for p in self.parameters() if id(p) not in handled and p.requires_grad]
         if other_params:
             groups.append({
                 "name": "other",
@@ -793,7 +853,9 @@ class UncHead(nn.Module):
     @dataclasses.dataclass(kw_only=True)
     class Config:
         dim_in: int
-        out_dim: int = 3
+        # One scalar variance per expert / patch by default.
+        # Set out_dim=3 only for the older coordinate-wise variance gating.
+        out_dim: int = 1
         arc_type: Literal["linear", "mlp"] = "mlp"
         hidden_ratio: float = 1.0
         head_dropout: float = 0.0
@@ -858,9 +920,22 @@ class UncExpertHead(nn.Module):
 
         sq_sigma = self.unc_head(x)
 
-        if y_pred.shape != sq_sigma.shape:
+        # sq_sigma may be either:
+        #   [B, 1, h, w]  -> scalar variance per expert / patch (preferred for pose)
+        #   [B, 3, h, w]  -> coordinate-wise variance (older behavior)
+        if sq_sigma.ndim != y_pred.ndim:
             raise RuntimeError(
-                "UncExpertHead: y_pred and sq_sigma must have the same shape. "
+                "UncExpertHead: y_pred and sq_sigma must have the same rank. "
+                f"got y_pred={tuple(y_pred.shape)}, sq_sigma={tuple(sq_sigma.shape)}"
+            )
+        if sq_sigma.shape[0] != y_pred.shape[0] or sq_sigma.shape[-2:] != y_pred.shape[-2:]:
+            raise RuntimeError(
+                "UncExpertHead: y_pred and sq_sigma batch/spatial shape mismatch. "
+                f"got y_pred={tuple(y_pred.shape)}, sq_sigma={tuple(sq_sigma.shape)}"
+            )
+        if sq_sigma.shape[1] not in (1, y_pred.shape[1]):
+            raise RuntimeError(
+                "UncExpertHead: sq_sigma channel count must be 1 or match coordinate channels. "
                 f"got y_pred={tuple(y_pred.shape)}, sq_sigma={tuple(sq_sigma.shape)}"
             )
 
@@ -1011,7 +1086,7 @@ class UncExpertFusionHead(SCRHead):
             if template_unc is None:
                 template_unc = UncHead.Config(
                     dim_in=self.c,
-                    out_dim=3,
+                    out_dim=1,
                     arc_type="mlp",
                     hidden_ratio=1.0,
                     head_dropout=0.0,
@@ -1019,7 +1094,7 @@ class UncExpertFusionHead(SCRHead):
                 )
 
             unc_cfgs = [
-                dataclasses.replace(template_unc, dim_in=self.c, out_dim=3)
+                dataclasses.replace(template_unc, dim_in=self.c)
                 for _ in range(k)
             ]
 
@@ -1038,6 +1113,10 @@ class UncExpertFusionHead(SCRHead):
                     unc_head=unc_head,
                 )
             )
+
+        # Track which coordinate MLP experts were loaded from checkpoints.
+        # The uncertainty heads remain newly initialized and trainable.
+        self._loaded_expert_indices: set[int] = set()
 
         # -------------------------------------------------
         # Optional: load pretrained MLPHead weights
@@ -1080,6 +1159,7 @@ class UncExpertFusionHead(SCRHead):
                 # Replace only the MLPHead.
                 # The UncHead remains newly initialized and trainable.
                 self.experts[i].mlp_head = loaded
+                self._loaded_expert_indices.add(i)
 
                 if self.config.freeze_loaded_experts:
                     for prm in self.experts[i].mlp_head.parameters():
@@ -1117,35 +1197,42 @@ class UncExpertFusionHead(SCRHead):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute aleatoric / epistemic / total uncertainty from expert predictions.
 
-        Args:
-            outputs: Per-expert predictions, shape [B, K, 3, h, w].
-            agg_outputs: Weighted expert output, shape [B, 3, h, w].
-            expert_unc: MoGU uncertainty per expert, shape [B, K, 3, h, w].
-                In this implementation this is variance, i.e. sigma^2, not std.
-            expert_weights: Normalized inverse-uncertainty expert weights,
-                shape [B, K, 3, h, w].
+        Supports two uncertainty/gating layouts:
+            outputs:        [B, K, 3, h, w]
+            expert_unc:     [B, K, 1, h, w] or [B, K, 3, h, w]
+            expert_weights: [B, K, 1, h, w] or [B, K, 3, h, w]
 
-        Returns:
-            aleatoric_unc: sum_i w_i * sigma_i^2, shape [B, 3, h, w].
-            epistemic_unc: sum_i w_i * (mu_i - mu_fused)^2, shape [B, 3, h, w].
-            total_unc: aleatoric_unc + epistemic_unc, shape [B, 3, h, w].
+        For scalar per-expert uncertainty, the scalar variance/weight is broadcast
+        over xyz only for uncertainty decomposition. The fused coordinates are still
+        computed with one coherent scalar expert weight per patch.
         """
         if outputs.ndim != 5:
             raise ValueError(f"outputs must have shape [B,K,3,h,w], got {tuple(outputs.shape)}")
         if agg_outputs.ndim != 4:
             raise ValueError(f"agg_outputs must have shape [B,3,h,w], got {tuple(agg_outputs.shape)}")
-        if expert_unc.shape != outputs.shape:
-            raise ValueError(
-                f"expert_unc shape {tuple(expert_unc.shape)} must match outputs {tuple(outputs.shape)}"
-            )
-        if expert_weights.shape != outputs.shape:
-            raise ValueError(
-                f"expert_weights shape {tuple(expert_weights.shape)} must match outputs {tuple(outputs.shape)}"
-            )
+        if outputs.shape[2] != 3:
+            raise ValueError(f"outputs must have 3 coordinate channels, got {outputs.shape[2]}")
 
-        aleatoric_unc = torch.sum(expert_unc * expert_weights, dim=1)
+        def _expand_coord(x: torch.Tensor, name: str) -> torch.Tensor:
+            if x.ndim != 5:
+                raise ValueError(f"{name} must have shape [B,K,1/3,h,w], got {tuple(x.shape)}")
+            if x.shape[:2] != outputs.shape[:2] or x.shape[-2:] != outputs.shape[-2:]:
+                raise ValueError(
+                    f"{name} batch/expert/spatial shape must match outputs. "
+                    f"got {tuple(x.shape)} vs outputs {tuple(outputs.shape)}"
+                )
+            if x.shape[2] == 1:
+                return x.expand_as(outputs)
+            if x.shape[2] == outputs.shape[2]:
+                return x
+            raise ValueError(f"{name} channel count must be 1 or 3, got {x.shape[2]}")
+
+        expert_unc_3 = _expand_coord(expert_unc, "expert_unc")
+        expert_weights_3 = _expand_coord(expert_weights, "expert_weights")
+
+        aleatoric_unc = torch.sum(expert_unc_3 * expert_weights_3, dim=1)
         expert_diff = (agg_outputs[:, None] - outputs) ** 2
-        epistemic_unc = torch.sum(expert_weights * expert_diff, dim=1)
+        epistemic_unc = torch.sum(expert_weights_3 * expert_diff, dim=1)
         total_unc = aleatoric_unc + epistemic_unc
         return aleatoric_unc, epistemic_unc, total_unc
 
@@ -1176,13 +1263,24 @@ class UncExpertFusionHead(SCRHead):
             predictions.append(y_pred_i)
             sq_sigmas.append(sq_sigma_i)
 
-        # [B, K, 3, h, w]
+        # preds:  [B, K, 3, h, w]
+        # sigmas: [B, K, 1, h, w] for scalar variance, or [B, K, 3, h, w] for legacy coord-wise variance.
         preds = torch.stack(predictions, dim=1)
         sigmas = torch.stack(sq_sigmas, dim=1)
 
-        if preds.shape != sigmas.shape:
+        if preds.ndim != 5 or sigmas.ndim != 5:
             raise RuntimeError(
-                "UncExpertFusionHead: preds and sigmas must have same shape. "
+                "UncExpertFusionHead: preds and sigmas must have rank 5. "
+                f"got preds={tuple(preds.shape)}, sigmas={tuple(sigmas.shape)}"
+            )
+        if sigmas.shape[:2] != preds.shape[:2] or sigmas.shape[-2:] != preds.shape[-2:]:
+            raise RuntimeError(
+                "UncExpertFusionHead: preds and sigmas batch/expert/spatial shape mismatch. "
+                f"got preds={tuple(preds.shape)}, sigmas={tuple(sigmas.shape)}"
+            )
+        if sigmas.shape[2] not in (1, preds.shape[2]):
+            raise RuntimeError(
+                "UncExpertFusionHead: sigmas channel count must be 1 or 3. "
                 f"got preds={tuple(preds.shape)}, sigmas={tuple(sigmas.shape)}"
             )
 
@@ -1196,7 +1294,8 @@ class UncExpertFusionHead(SCRHead):
         )
         inv_var = 1.0 / (sigmas_safe.float() + eps)
 
-        # Normalize over expert dimension K
+        # Normalize over expert dimension K. If sigmas has one channel, this is one
+        # scalar weight per expert/patch and broadcasts coherently over xyz.
         weights = inv_var / inv_var.sum(dim=1, keepdim=True)
         
         # SANITY CHECK: force a specific expert
@@ -1204,7 +1303,8 @@ class UncExpertFusionHead(SCRHead):
             weights = torch.zeros_like(weights)
             weights[:, self.config.sanity_check_force_expert] = 1.0
         
-        # Weighted coordinate prediction
+        # Weighted coordinate prediction. For scalar weights [B,K,1,h,w], broadcasting
+        # gives one coherent expert weight over x/y/z.
         y_hat = (weights * preds.float()).sum(dim=1)
 
         # Uncertainty decomposition used to optionally override the dyntanh tau in ReproLoss.
@@ -1255,8 +1355,8 @@ class UncExpertFusionHead(SCRHead):
 
         Uses:
             self.last_expert_preds: [B, K, 3, h, w]
-            self.last_sq_sigmas:    [B, K, 3, h, w]
-            self.last_moe_weights:  [B, K, 3, h, w]
+            self.last_sq_sigmas:    [B, K, 1/3, h, w]
+            self.last_moe_weights:  [B, K, 1/3, h, w]
 
         Returns:
             Scalar MoGU loss.
@@ -1287,10 +1387,20 @@ class UncExpertFusionHead(SCRHead):
             min=float(self.config.var_min),
             max=float(self.config.var_max),
         )
+        if sigmas.shape[2] == 1:
+            sigmas_nll = sigmas.expand_as(preds)
+        elif sigmas.shape == preds.shape:
+            sigmas_nll = sigmas
+        else:
+            raise RuntimeError(
+                "compute_mogu_loss: sigmas must have shape [B,K,1,h,w] or [B,K,3,h,w]. "
+                f"got sigmas={tuple(sigmas.shape)}, preds={tuple(preds.shape)}"
+            )
+
         nll = torch.nn.functional.gaussian_nll_loss(
             input=preds,
             target=target,
-            var=sigmas,
+            var=sigmas_nll,
             reduction="none",
         )
 
@@ -1339,7 +1449,7 @@ class UncExpertFusionHead(SCRHead):
         from ace_g import losses as ace_losses
 
         preds = self.last_expert_preds.float()       # [B, K, 3, h, w]
-        sigmas = self.last_sq_sigmas.float()         # [B, K, 3, h, w], variance in m^2
+        sigmas = self.last_sq_sigmas.float()         # [B, K, 1/3, h, w], variance in m^2
 
         b, k, d, h, w = preds.shape
         if d != 3:
@@ -1442,6 +1552,69 @@ class UncExpertFusionHead(SCRHead):
         self.last_mogu_reproj_weights = weights.detach()
         return loss_mogu
 
+    def apply_freeze_policy(self) -> None:
+        """Freeze loaded coordinate MLP experts if requested; keep uncertainty heads trainable.
+
+        This must be safe to call more than once. The trainer calls
+        head.requires_grad_(train_head) globally, which would otherwise undo
+        the freeze performed during __init__().
+        """
+        if not bool(getattr(self.config, "freeze_loaded_experts", False)):
+            return
+
+        for idx in getattr(self, "_loaded_expert_indices", set()):
+            for prm in self.experts[idx].mlp_head.parameters():
+                prm.requires_grad_(False)
+
+            # Explicitly keep the uncertainty heads trainable.
+            for prm in self.experts[idx].unc_head.parameters():
+                prm.requires_grad_(True)
+
+    def assert_freeze_policy(self) -> None:
+        """Fail fast if loaded coordinate experts are supposed to be frozen but are trainable."""
+        if not bool(getattr(self.config, "freeze_loaded_experts", False)):
+            return
+
+        offenders = []
+        for idx in getattr(self, "_loaded_expert_indices", set()):
+            for name, prm in self.experts[idx].mlp_head.named_parameters():
+                if prm.requires_grad:
+                    offenders.append(f"experts.{idx}.mlp_head.{name}")
+
+        if offenders:
+            shown = ", ".join(offenders[:10])
+            raise RuntimeError(
+                "freeze_loaded_experts=True, but loaded coordinate experts are trainable. "
+                f"Examples: {shown}"
+            )
+
+    def get_freeze_diagnostics(self) -> dict[str, int]:
+        """Return parameter counts for quick logging / verification."""
+        loaded = getattr(self, "_loaded_expert_indices", set())
+        mlp_total = 0
+        mlp_trainable = 0
+        unc_total = 0
+        unc_trainable = 0
+
+        for idx in loaded:
+            for prm in self.experts[idx].mlp_head.parameters():
+                n = prm.numel()
+                mlp_total += n
+                if prm.requires_grad:
+                    mlp_trainable += n
+            for prm in self.experts[idx].unc_head.parameters():
+                n = prm.numel()
+                unc_total += n
+                if prm.requires_grad:
+                    unc_trainable += n
+
+        return {
+            "loaded_mlp_expert_param_count": int(mlp_total),
+            "loaded_mlp_expert_trainable_param_count": int(mlp_trainable),
+            "loaded_unc_head_param_count": int(unc_total),
+            "loaded_unc_head_trainable_param_count": int(unc_trainable),
+        }
+
     def unfreeze_experts_if_needed(self, iteration: int):
         # Keep same API as LateFusionCoordHead, but only applies to MLPHeads.
         # UncHeads are trainable from the beginning.
@@ -1461,12 +1634,19 @@ class UncExpertFusionHead(SCRHead):
 
         groups = []
 
-        mlp_params = []
-        unc_params = []
+        all_mlp_params = []
+        all_unc_params = []
 
         for expert in self.experts:
-            mlp_params.extend(list(expert.mlp_head.parameters()))
-            unc_params.extend(list(expert.unc_head.parameters()))
+            all_mlp_params.extend(list(expert.mlp_head.parameters()))
+            all_unc_params.extend(list(expert.unc_head.parameters()))
+
+        # If coordinate experts are frozen forever, keep them out of the optimizer.
+        # If scheduled unfreezing is requested, keep them in the optimizer group
+        # while requires_grad=False; they will start receiving gradients only after unfreeze.
+        unfreeze_iter = int(getattr(self.config, 'unfreeze_experts_after_iterations', -1))
+        mlp_params = all_mlp_params if unfreeze_iter > 0 else [p for p in all_mlp_params if p.requires_grad]
+        unc_params = [p for p in all_unc_params if p.requires_grad]
 
         if mlp_params:
             groups.append({
@@ -1486,11 +1666,11 @@ class UncExpertFusionHead(SCRHead):
                 "min_lr": unc_min,
             })
 
-        handled = set(id(p) for p in mlp_params + unc_params)
+        handled = set(id(p) for p in all_mlp_params + all_unc_params)
 
         other_params = [
             p for p in self.parameters()
-            if id(p) not in handled
+            if id(p) not in handled and p.requires_grad
         ]
 
         if other_params:
