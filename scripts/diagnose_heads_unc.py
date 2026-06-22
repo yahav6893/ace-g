@@ -181,7 +181,18 @@ def _import_obj(obj_type: str):
     return getattr(importlib.import_module(mod), name)
 
 
-def load_img_tensor(path: str | Path, max_side: int | None) -> torch.Tensor:
+def load_img_tensor(path: str | Path, max_side: int | None, use_color: bool = False) -> torch.Tensor:
+    """Load an image preprocessed exactly like the training/eval dataset.
+
+    The encoders were trained on inputs produced by CamLocDataset
+    (src/ace_g/datasets.py): grayscale (when use_color is False) -> ToTensor ->
+    Normalize(mean=[0.4], std=[0.25]). Feeding raw RGB/255 here would be
+    out-of-distribution and yields garbage predictions, so we replicate the same
+    torchvision transform. use_color must match the dataset config's `use_color`
+    (default False); the encoders broadcast the single grayscale channel to 3.
+    """
+    from torchvision import transforms as torch_transforms
+
     im = Image.open(path).convert("RGB")
     if max_side is not None:
         w, h = im.size
@@ -189,8 +200,13 @@ def load_img_tensor(path: str | Path, max_side: int | None) -> torch.Tensor:
         if s > max_side:
             scale = max_side / float(s)
             im = im.resize((int(round(w * scale)), int(round(h * scale))), Image.BILINEAR)
-    arr = np.asarray(im).astype(np.float32) / 255.0
-    x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+
+    tfs = []
+    if not use_color:
+        tfs.append(torch_transforms.Grayscale())
+    tfs.append(torch_transforms.ToTensor())
+    tfs.append(torch_transforms.Normalize(mean=[0.4], std=[0.25]))
+    x = torch_transforms.Compose(tfs)(im).unsqueeze(0)
     return x
 
 
@@ -277,8 +293,13 @@ def extract_uncertainty_decisions(head, patch_embeddings: torch.Tensor):
             "Head did not expose last_expert_preds/last_sq_sigmas/last_moe_weights. "
             "This diagnostic expects UncExpertFusionHead.forward() to store these tensors."
         )
-    if preds.shape != sigmas.shape:
-        raise ScriptError(f"preds/sigmas shape mismatch: {tuple(preds.shape)} vs {tuple(sigmas.shape)}")
+    # sigmas may be scalar-per-expert ([B,K,1,h,w]) or coordinate-wise ([B,K,3,h,w]).
+    if preds.ndim != sigmas.ndim:
+        raise ScriptError(f"preds/sigmas rank mismatch: {tuple(preds.shape)} vs {tuple(sigmas.shape)}")
+    if preds.shape[:2] != sigmas.shape[:2] or preds.shape[-2:] != sigmas.shape[-2:]:
+        raise ScriptError(f"preds/sigmas B,K/spatial mismatch: {tuple(preds.shape)} vs {tuple(sigmas.shape)}")
+    if sigmas.shape[2] not in (1, preds.shape[2]):
+        raise ScriptError(f"preds/sigmas coord dim mismatch: {tuple(preds.shape)} vs {tuple(sigmas.shape)}")
     if weights.ndim != sigmas.ndim:
         raise ScriptError(f"weights/sigmas ndim mismatch: {tuple(weights.shape)} vs {tuple(sigmas.shape)}")
     if weights.shape[0] != sigmas.shape[0] or weights.shape[1] != sigmas.shape[1]:
@@ -486,13 +507,15 @@ def cmd_uncertainty_decisions(args: argparse.Namespace) -> int:
                     f"w_mean={row['weight_mean']:.4f} w_min={row['weight_min']:.4f} w_max={row['weight_max']:.4f} "
                     f"patch_win%={100.0 * row['patch_win_frac']:.1f}"
                 )
-                if "x_win_frac" in row:
+                if all(f"{c}_win_frac" in row for c in ("x", "y", "z")):
                     msg += (
                         f" xyz_win%="
                         f"{100.0 * row['x_win_frac']:.1f}/"
                         f"{100.0 * row['y_win_frac']:.1f}/"
                         f"{100.0 * row['z_win_frac']:.1f}"
                     )
+                elif "scalar_win_frac" in row:
+                    msg += f" patch_win%(scalar)={100.0 * row['scalar_win_frac']:.1f}"
                 print(msg)
 
             if args.save_maps:
@@ -530,6 +553,233 @@ def cmd_uncertainty_decisions(args: argparse.Namespace) -> int:
 
     print("\nDone.")
     return 0
+
+def cmd_repro_vs_pose(args: argparse.Namespace) -> int:
+    """Per-expert mean/median per-patch 2D reprojection error vs GT, for UncExpertFusionHead.
+
+    Answers: does the gate's training objective (per-patch reprojection error) actually rank the
+    experts the same way the RANSAC-PnP pose metric does? If the worse-pose expert has the LOWER
+    per-patch reprojection error, the gate is correctly minimizing its objective and the objective
+    is the wrong proxy (objective != metric).
+    """
+    print_stage_header("REPRO VS POSE")
+    ensure_ace_g_importable(args.repo_root)
+    from ace_g import data_io, losses, utils
+
+    cfg_path = expand(args.config_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    encs = build_encoders_from_cfg(cfg)
+    head = load_head(args.repo_root, args.head_path)
+
+    if not hasattr(head, "config") or not hasattr(head.config, "sanity_check_force_expert"):
+        raise ScriptError("repro-vs-pose expects an UncExpertFusionHead (config.sanity_check_force_expert).")
+    k = int(head.config.num_experts)
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    use_half = args.use_half and device == "cuda"
+    for i in range(len(encs)):
+        encs[i] = encs[i].to(device).eval()
+    head = head.to(device).eval()
+
+    paths = sorted(glob.glob(args.rgb_glob))
+    if getattr(args, "random_sample", False):
+        import random
+        random.seed(getattr(args, "seed", 42))
+        random.shuffle(paths)
+    paths = paths[: args.num_images]
+    if not paths:
+        raise ScriptError(f"No images matched: {args.rgb_glob}")
+
+    cap = float(args.valid_cap_px)
+    modes = [("expert%d" % i, i) for i in range(k)] + [("fused", None)]
+    dists: dict[str, list[np.ndarray]] = {m: [] for m, _ in modes}
+    weight_means = np.zeros(k, dtype=np.float64)
+    n_imgs = 0
+
+    print(f"config_path: {cfg_path}")
+    print(f"head_path  : {expand(args.head_path)}")
+    print(f"device={device} use_half={use_half} images={len(paths)} valid_cap_px={cap}")
+
+    depth_lists: dict[str, list[np.ndarray]] = {m: [] for m, _ in modes}
+    cross_dz: list[np.ndarray] = []   # |z_expert0 - z_expert1| on commonly low-reproj patches
+    cross_rel: list[np.ndarray] = []
+    per_image: dict[str, dict[str, float]] = {m: {} for m, _ in modes}  # mode -> img_name -> median reproj px
+
+    orig_force = head.config.sanity_check_force_expert
+    with torch.no_grad():
+        for p in paths:
+            p_path = Path(p)
+            pose_path = p_path.parent.parent / "poses" / f"{p_path.stem}.txt"
+            calib_path = p_path.parent.parent / "calibration" / f"{p_path.stem}.txt"
+            if not pose_path.exists() or not calib_path.exists():
+                raise ScriptError(f"Missing GT pose or calib for {p}")
+
+            x = load_img_tensor(p, args.max_side).to(device)
+            with torch.autocast("cuda", enabled=use_half):
+                feats = run_concat_features(encs, x)
+
+            pose_c2w = data_io.load_pose(pose_path)
+            w2c_44 = pose_c2w.inverse()
+            w2c_b34 = w2c_44[:3, :4].unsqueeze(0).to(device)
+
+            calib = data_io.load_calibration(calib_path)
+            im = Image.open(p)
+            w_orig, h_orig = im.size
+            s = max(w_orig, h_orig)
+            scale = args.max_side / float(s) if s > args.max_side else 1.0
+            if isinstance(calib, float):
+                fx = fy = calib
+                cx, cy = w_orig / 2, h_orig / 2
+            else:
+                fx, fy, cx, cy = calib[0, 0], calib[1, 1], calib[0, 2], calib[1, 2]
+            intrinsics = torch.eye(3)
+            intrinsics[0, 0] = fx * scale
+            intrinsics[1, 1] = fy * scale
+            intrinsics[0, 2] = cx * scale
+            intrinsics[1, 2] = cy * scale
+
+            sub_h = int(round(x.shape[-2] / feats.shape[-2]))
+            pixel_grid_2hw = utils.get_pixel_grid(sub_h).to(device)
+            pixel_grid_2hw = pixel_grid_2hw[:, : feats.shape[-2], : feats.shape[-1]]
+            _, h_f, w_f = pixel_grid_2hw.shape
+            target_px_b2 = pixel_grid_2hw.reshape(2, -1).permute(1, 0)
+            target_coords_b3 = torch.zeros((h_f * w_f, 3), device=device)
+            n_patches = h_f * w_f
+            w2c_exp = w2c_b34.expand(n_patches, 3, 4)
+            k_exp = intrinsics.unsqueeze(0).to(device).expand(n_patches, 3, 3)
+
+            # Camera-frame depth is z = R[2,:] . X_world + t[2] (depth-blindness lives here).
+            r2 = w2c_b34[0, 2, :3]
+            t2 = w2c_b34[0, 2, 3]
+            img_z: dict[str, np.ndarray] = {}
+            img_d: dict[str, np.ndarray] = {}
+            for mode, force in modes:
+                head.config.sanity_check_force_expert = force
+                with torch.autocast("cuda", enabled=use_half):
+                    y, _ = head(feats)
+                pred_b3 = y.permute(0, 2, 3, 1).reshape(-1, 3).float()
+                _, _, _, _, d2d = losses.compute_loss(
+                    pred_coords=pred_b3,
+                    pred_uncertainties=None,
+                    w2c_b34=w2c_exp,
+                    image_from_camera_b33=k_exp,
+                    target_pixels=target_px_b2,
+                    target_coords=target_coords_b3,
+                    supervision_type="2d",
+                    use_depth_as_prior=False,
+                )
+                d2d_np = d2d.detach().float().cpu().numpy().reshape(-1)
+                z_np = ((pred_b3 * r2).sum(-1) + t2).detach().float().cpu().numpy().reshape(-1)
+                dists[mode].append(d2d_np)
+                depth_lists[mode].append(z_np)
+                img_z[mode], img_d[mode] = z_np, d2d_np
+                if force is None:
+                    w = head.last_moe_weights  # [1,K,1,h,w]
+                    weight_means += w[0].mean(dim=(1, 2, 3)).detach().float().cpu().numpy()
+
+            # Cross-expert depth disagreement on patches where BOTH experts reproject well.
+            if "expert0" in img_d and "expert1" in img_d:
+                v = (
+                    np.isfinite(img_d["expert0"]) & np.isfinite(img_d["expert1"])
+                    & (img_d["expert0"] < cap) & (img_d["expert1"] < cap)
+                )
+                if v.any():
+                    z0, z1 = img_z["expert0"][v], img_z["expert1"][v]
+                    denom = np.clip((np.abs(z0) + np.abs(z1)) / 2.0, 1e-6, None)
+                    cross_dz.append(np.abs(z0 - z1))
+                    cross_rel.append(np.abs(z0 - z1) / denom)
+
+            for mode, _ in modes:
+                dm = img_d[mode]
+                fin = dm[np.isfinite(dm)]
+                per_image[mode][p_path.name] = float(np.median(fin)) if fin.size else float("nan")
+            n_imgs += 1
+    head.config.sanity_check_force_expert = orig_force
+
+    def _summ(arr: np.ndarray) -> dict[str, float]:
+        fin = arr[np.isfinite(arr)]
+        valid = fin[fin < cap]
+        n = float(fin.size) if fin.size else 1.0
+        return {
+            "median_px": float(np.median(fin)),
+            "mean_px": float(np.mean(fin)),
+            "mean_valid_px": float(np.mean(valid)) if valid.size else float("nan"),
+            "frac_valid": float(valid.size / n),
+            "p10": float(np.percentile(fin, 10)),
+            "p25": float(np.percentile(fin, 25)),
+            "p75": float(np.percentile(fin, 75)),
+            "p90": float(np.percentile(fin, 90)),
+            # Low-error tail = "inlier-grade" patches that RANSAC-PnP can lock onto.
+            "frac_lt1px": float((fin < 1.0).sum() / n),
+            "frac_lt2px": float((fin < 2.0).sum() / n),
+            "frac_lt5px": float((fin < 5.0).sum() / n),
+        }
+
+    weight_means /= max(n_imgs, 1)
+    print("\n================ PER-PATCH REPROJECTION ERROR (px) ================")
+    summary = {"images": n_imgs, "valid_cap_px": cap, "gate_weight_mean": weight_means.tolist(), "modes": {}}
+    for mode, _ in modes:
+        arr = np.concatenate(dists[mode])
+        st = _summ(arr)
+        summary["modes"][mode] = st
+        wtxt = ""
+        if mode.startswith("expert"):
+            wtxt = f"  gate_w={weight_means[int(mode[6:])]:.3f}"
+        print(
+            f"{mode:8s}: median={st['median_px']:7.3f}  mean={st['mean_px']:8.2f}  "
+            f"p10={st['p10']:6.3f}  %<1px={100*st['frac_lt1px']:5.1f}  %<2px={100*st['frac_lt2px']:5.1f}  "
+            f"%<5px={100*st['frac_lt5px']:5.1f}{wtxt}"
+        )
+    print("\nInterpretation:")
+    print("  - If a worse-POSE expert has LOWER median reprojection -> objective != pose metric.")
+    print("  - %<1px / %<2px is the 'inlier-grade' tail RANSAC-PnP locks onto; a better-POSE expert")
+    print("    should have a FATTER low-error tail (more pinpoint patches) even if its median is higher.")
+
+    # ----- Camera-frame depth structure (the dimension reprojection is blind to) -----
+    def _depth_summ(arr: np.ndarray) -> dict[str, float]:
+        zv = arr[np.isfinite(arr) & (arr > 0.1) & (arr < 1000.0)]
+        if zv.size == 0:
+            return {"median_z": float("nan"), "std_z": float("nan"), "iqr_p10_90": float("nan"), "frac_valid": 0.0}
+        return {
+            "median_z": float(np.median(zv)),
+            "std_z": float(np.std(zv)),
+            "iqr_p10_90": float(np.percentile(zv, 90) - np.percentile(zv, 10)),
+            "frac_valid": float(zv.size / arr.size),
+        }
+
+    print("\n============ CAMERA-FRAME DEPTH STRUCTURE (z, meters) ============")
+    summary["depth"] = {}
+    for mode, _ in modes:
+        zs = _depth_summ(np.concatenate(depth_lists[mode]))
+        summary["depth"][mode] = zs
+        print(
+            f"{mode:8s}: median_z={zs['median_z']:7.2f}  std_z={zs['std_z']:7.2f}  "
+            f"spread(p10-90)={zs['iqr_p10_90']:7.2f}  %valid_depth={100*zs['frac_valid']:5.1f}"
+        )
+    if cross_dz:
+        dz = np.concatenate(cross_dz)
+        rel = np.concatenate(cross_rel)
+        summary["depth"]["expert0_vs_expert1_disagreement"] = {
+            "median_abs_dz_m": float(np.median(dz)),
+            "median_rel_dz": float(np.median(rel)),
+            "p90_abs_dz_m": float(np.percentile(dz, 90)),
+        }
+        print(
+            f"\nexpert0 vs expert1 depth disagreement on patches BOTH reproject well (<{cap:g}px):\n"
+            f"  median|dz|={np.median(dz):.3f} m   median rel|dz|={np.median(rel):.3f}   p90|dz|={np.percentile(dz,90):.3f} m"
+        )
+        print("  Large disagreement here = the experts encode DIFFERENT depth for the same well-reprojecting")
+        print("  patch -> reprojection cannot see it, but PnP pose can. A compressed std_z/spread for the")
+        print("  worse-pose expert = degenerate depth geometry driving its bad pose.")
+
+    summary["per_image_median_reproj_px"] = per_image
+    if args.out_json:
+        out_json = expand(args.out_json)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"wrote_json: {out_json}")
+    return 0
+
 
 def cmd_gate_weights(args: argparse.Namespace) -> int:
     print_stage_header("GATE WEIGHTS")
@@ -876,6 +1126,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg = sp.add_parser("print-config", help="Print selected head config fields")
     p_cfg.add_argument("--head-path", required=True)
     p_cfg.set_defaults(func=cmd_print_config)
+
+    p_rp = sp.add_parser(
+        "repro-vs-pose",
+        help="Per-expert mean/median per-patch 2D reprojection error vs GT (objective-vs-metric check)",
+    )
+    p_rp.add_argument("--config-path", required=True, help="Path to the MoGU/fusion config YAML")
+    p_rp.add_argument("--head-path", required=True, help="Path to the trained UncExpertFusionHead checkpoint")
+    p_rp.add_argument("--rgb-glob", required=True, help="Glob for sample RGB test images")
+    p_rp.add_argument("--num-images", type=int, default=25)
+    p_rp.add_argument("--random-sample", action="store_true")
+    p_rp.add_argument("--seed", type=int, default=42)
+    p_rp.add_argument("--max-side", type=int, default=640)
+    p_rp.add_argument("--device", default=None)
+    p_rp.add_argument("--use-half", action="store_true")
+    p_rp.add_argument("--valid-cap-px", type=float, default=100.0, help="Cap for the robust mean(<cap) summary")
+    p_rp.add_argument("--out-json", default=None)
+    p_rp.set_defaults(func=cmd_repro_vs_pose)
     return p
 
 

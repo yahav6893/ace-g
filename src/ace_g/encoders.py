@@ -49,13 +49,17 @@ class ListMultiEncoder(Encoder):
       - output: (..., K*C, H', W') where K=len(encoders)
 
     Constraints:
-      - all sub-encoders must have identical subsample_factor and dim_out
+      - all sub-encoders must have identical subsample_factor
       - all must produce identical spatial output size for a given input
+      - dim_out may differ across sub-encoders only when allow_uneven_dims=True
+        (heterogeneous fusion: e.g. DINOv2-L=1024 + FiT3D-B=768). The concatenated
+        output dim_out is then sum(per-encoder dims) and the per-encoder split is
+        recorded in self.expert_dims for the downstream fusion head.
     """
 
     supports_rgb = True
 
-    def __init__(self, encoders: list[EncoderConfig]) -> None:
+    def __init__(self, encoders: list[EncoderConfig], allow_uneven_dims: bool = False) -> None:
         super().__init__()
         assert encoders and len(encoders) >= 1, "ListMultiEncoder requires a non-empty encoders list."
 
@@ -63,14 +67,21 @@ class ListMultiEncoder(Encoder):
         self.num_encoders = len(self.encoders)
 
         sf = self.encoders[0].subsample_factor
-        dim = self.encoders[0].dim_out
+        dims = [e.dim_out for e in self.encoders]
         for i, e in enumerate(self.encoders):
             assert e.subsample_factor == sf, f"subsample_factor mismatch at enc[{i}]"
-            assert e.dim_out == dim, f"dim_out mismatch at enc[{i}]"
+            if not allow_uneven_dims:
+                assert e.dim_out == dims[0], (
+                    f"dim_out mismatch at enc[{i}] ({e.dim_out} != {dims[0]}); "
+                    "set allow_uneven_dims=True for heterogeneous fusion."
+                )
 
         self.subsample_factor = sf
-        self.dim_out_single = dim
-        self.dim_out = self.num_encoders * self.dim_out_single
+        # Per-encoder output channel sizes, in encoder order. The fusion head consumes this
+        # to split the concatenated tensor (works for both even and uneven dims).
+        self.expert_dims = dims
+        self.dim_out_single = dims[0]  # retained for backward compatibility (even-dim case)
+        self.dim_out = sum(dims)
         self.supports_rgb = all(getattr(e, "supports_rgb", False) for e in self.encoders)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -355,6 +366,328 @@ class DINOv3Encoder(Encoder):
             .reshape(*leading_dims, -1, h // self.subsample_factor, w // self.subsample_factor)
         )
         return patch_features
+
+
+class FiT3DEncoder(Encoder):
+    """FiT3D 3D-aware fine-tuned 2D-foundation-feature encoder.
+
+    FiT3D ("Improving 2D Feature Representations by 3D-Aware Fine-Tuning", Yue et al., ECCV 2024)
+    fine-tunes 2D foundation backbones (e.g. DINOv2) to be 3D-aware *without* predicting metric or
+    relative depth. Unlike a relative-depth model (``DPTv2Encoder``), its features stay
+    appearance-derived, so it does not inject a relative-depth scale/shift bias into scene-coordinate
+    regression while still carrying geometry-consistent structure.
+
+    Models are loaded via ``torch.hub`` from the FiT3D repo (default ``ywyue/FiT3D``). The fine-tuned
+    backbones expose the standard DINOv2 ``forward_features`` interface, from which the normalized
+    patch tokens are extracted. Verify the exact model name against the FiT3D model zoo; common names:
+        dinov2_small_fine       (ViT-S/14,  384-d)
+        dinov2_reg_small_fine   (ViT-S/14 + registers, 384-d)
+        dinov2_base_fine        (ViT-B/14,  768-d)
+        dinov2_reg_base_fine    (ViT-B/14 + registers, 768-d)
+    """
+
+    supports_rgb = True
+
+    def __init__(
+        self,
+        model_name: str = "dinov2_base_fine",
+        repo: str = "ywyue/FiT3D",
+        repo_dir: str | pathlib.Path | None = None,
+        checkpoint: str | pathlib.Path | None = None,
+    ) -> None:
+        """Initialize the FiT3D encoder.
+
+        Args:
+            model_name: Name of the fine-tuned model to load via ``torch.hub.load``.
+            repo: GitHub ``owner/repo`` for the FiT3D hub (used when ``repo_dir`` is None).
+            repo_dir: Optional path to a local clone of the FiT3D repository (uses ``source="local"``).
+            checkpoint: Optional path/URL to override the backbone weights (loaded with strict=False).
+        """
+        super(FiT3DEncoder, self).__init__()
+
+        if repo_dir is not None:
+            self.model = torch.hub.load(
+                str(repo_dir), model_name, source="local", verbose=True, trust_repo=True, skip_validation=True
+            )
+        else:
+            self.model = torch.hub.load(
+                repo, model_name, source="github", verbose=True, trust_repo=True, skip_validation=True
+            )
+
+        if checkpoint is not None:
+            state_dict = torch.load(pathlib.Path(checkpoint), map_location="cpu", weights_only=False)
+            if isinstance(state_dict, dict):
+                for key in ("state_dict", "model"):
+                    if key in state_dict and isinstance(state_dict[key], dict):
+                        state_dict = state_dict[key]
+                        break
+            incompatible = self.model.load_state_dict(state_dict, strict=False)
+            if getattr(incompatible, "missing_keys", None):
+                _logger.warning(f"FiT3DEncoder: missing keys (up to 10): {incompatible.missing_keys[:10]}")
+            if getattr(incompatible, "unexpected_keys", None):
+                _logger.warning(f"FiT3DEncoder: unexpected keys (up to 10): {incompatible.unexpected_keys[:10]}")
+
+        patch_embed = getattr(self.model, "patch_embed", None)
+        if patch_embed is not None and hasattr(patch_embed, "patch_size"):
+            ps = patch_embed.patch_size
+            self.subsample_factor = ps[0] if isinstance(ps, (tuple, list)) else int(ps)
+        else:
+            self.subsample_factor = 14  # DINOv2 default patch size
+
+        # dim_out must be concrete before the head is built (train_single_scene reads encoder.dim_out).
+        dim_out = getattr(self.model, "embed_dim", None)
+        if dim_out is None:
+            with torch.no_grad():
+                probe = torch.zeros(1, 3, self.subsample_factor * 4, self.subsample_factor * 4)
+                dim_out = self._extract_patch_tokens(probe, 4, 4).shape[1]
+        self.dim_out = int(dim_out)
+
+    def _extract_patch_tokens(self, images: torch.Tensor, hp: int, wp: int) -> torch.Tensor:
+        """Return patch tokens as [B, C, hp, wp] from a DINOv2-style backbone, defensively."""
+        out = self.model.forward_features(images)
+        if isinstance(out, dict):
+            tokens = out.get("x_norm_patchtokens")
+            if tokens is None:
+                raise RuntimeError(
+                    "FiT3DEncoder: forward_features dict lacks 'x_norm_patchtokens'. "
+                    f"keys={list(out.keys())}"
+                )
+        elif torch.is_tensor(out):
+            if out.ndim == 4:  # already [B, C, hp, wp]
+                return out
+            if out.ndim == 3:  # [B, N, C]; patch tokens are the trailing hp*wp entries (after cls/registers)
+                tokens = out if out.shape[1] == hp * wp else out[:, -hp * wp :, :]
+            else:
+                raise RuntimeError(f"FiT3DEncoder: unexpected feature shape {tuple(out.shape)}")
+        else:
+            raise RuntimeError(f"FiT3DEncoder: unexpected forward_features output type {type(out)}")
+        b = tokens.shape[0]
+        return tokens.permute(0, 2, 1).reshape(b, -1, hp, wp)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Compute patch features for images. Shape (..., 3 or 1, H, W) -> (..., dim_out, H', W')."""
+        leading_dims = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.view(-1, c, h, w)
+        if c == 1:  # broadcast grayscale to 3 channels
+            images = images.expand(-1, 3, -1, -1)
+        images = images[
+            ...,
+            : self.subsample_factor * (h // self.subsample_factor),
+            : self.subsample_factor * (w // self.subsample_factor),
+        ]
+        hp = h // self.subsample_factor
+        wp = w // self.subsample_factor
+        feats = self._extract_patch_tokens(images, hp, wp)  # [B, C, hp, wp]
+        return feats.reshape(*leading_dims, feats.shape[1], hp, wp)
+
+
+class MASt3REncoder(Encoder):
+    """MASt3R image-encoder features (metric, 3D-grounded; complementary to DINOv2 without DPT bias).
+
+    MASt3R ("Grounding Image Matching in 3D with MASt3R", Leroy et al. 2024) builds on DUSt3R/CroCo
+    and is trained for metric, multi-view-consistent 3D. Its image encoder yields patch features that
+    carry geometry while being metric-grounded, so (unlike a relative-depth DPT backbone) it should
+    not inject a relative scale/shift depth bias into scene-coordinate regression.
+
+    NOTE: MASt3R is NOT a torch.hub one-liner. This encoder requires the ``mast3r``/``dust3r`` packages
+    importable and a checkpoint (e.g. the official ``MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric``).
+    It uses the model's ``_encode_image`` (CroCo/DUSt3R API). VERIFY the import path, checkpoint, the
+    expected input normalization (DUSt3R uses ImageNet mean/std), and patch size before training.
+    """
+
+    supports_rgb = True
+
+    def __init__(self, checkpoint: str | pathlib.Path, patch_size: int = 16) -> None:
+        """Initialize the MASt3R encoder.
+
+        Args:
+            checkpoint: Path (or HF id) to the MASt3R checkpoint.
+            patch_size: Encoder patch size (CroCo ViT-L uses 16). Used as subsample_factor.
+        """
+        super(MASt3REncoder, self).__init__()
+
+        try:
+            from mast3r.model import AsymmetricMASt3R as _Model  # type: ignore
+        except Exception:
+            try:
+                from dust3r.model import AsymmetricCroCo3DStereo as _Model  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                raise ImportError(
+                    "MASt3REncoder requires the 'mast3r' (or 'dust3r') package importable. "
+                    "Install it and ensure it is on PYTHONPATH."
+                ) from exc
+
+        if hasattr(_Model, "from_pretrained"):
+            self.model = _Model.from_pretrained(str(checkpoint))
+        else:  # pragma: no cover - depends on package version
+            self.model = _Model()
+            sd = torch.load(pathlib.Path(checkpoint), map_location="cpu", weights_only=False)
+            sd = sd.get("model", sd) if isinstance(sd, dict) else sd
+            self.model.load_state_dict(sd, strict=False)
+
+        self.model.eval()
+        self.subsample_factor = patch_size
+        self.dim_out = int(getattr(self.model, "enc_embed_dim", 1024))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Compute MASt3R encoder patch features. (..., 3 or 1, H, W) -> (..., dim_out, H', W')."""
+        leading_dims = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.view(-1, c, h, w)
+        if c == 1:
+            images = images.expand(-1, 3, -1, -1)
+        h = self.subsample_factor * (h // self.subsample_factor)
+        w = self.subsample_factor * (w // self.subsample_factor)
+        images = images[..., :h, :w]
+        hp, wp = h // self.subsample_factor, w // self.subsample_factor
+
+        true_shape = torch.tensor([[h, w]], device=images.device).expand(images.shape[0], 2)
+        feat, _pos = self.model._encode_image(images, true_shape)  # [B, hp*wp, C]
+        if feat.ndim == 3:
+            feat = feat.permute(0, 2, 1).reshape(images.shape[0], -1, hp, wp)
+        return feat.reshape(*leading_dims, feat.shape[-3], hp, wp)
+
+
+class SemanticDINOv2Encoder(Encoder):
+    """DINOv2 backbone with an optional linear semantic-segmentation head, used as an expert input.
+
+    With ``seg_checkpoint`` set, the per-patch class logits ([B, num_classes, H', W']) are emitted as
+    the feature map (a semantic, appearance-derived signal with no depth bias). Without a head it falls
+    back to the DINOv2 backbone patch features (equivalent to ``DINOv2Encoder``), so the config is
+    runnable before you supply a segmentation head.
+
+    The head is a 1x1 conv ``embed_dim -> num_classes`` (a DINOv2 linear seg head). Provide its weights
+    via ``seg_checkpoint`` (a state_dict with 'weight'/'bias', or {'weight','bias'} under a sub-key).
+    """
+
+    supports_rgb = True
+
+    def __init__(
+        self,
+        model_name: str = "dinov2_vitl14",
+        seg_checkpoint: str | pathlib.Path | None = None,
+        num_classes: int = 150,
+    ) -> None:
+        super(SemanticDINOv2Encoder, self).__init__()
+        self.dinov2 = torch.hub.load(
+            "facebookresearch/dinov2", model_name, verbose=True, trust_repo=True, source="github", skip_validation=True
+        )
+        self.subsample_factor = self.dinov2.patch_embed.patch_size[0]  # type: ignore
+        embed_dim = self.dinov2.embed_dim  # type: ignore
+
+        self.seg_head: nn.Module | None = None
+        if seg_checkpoint is not None:
+            head = nn.Conv2d(embed_dim, num_classes, kernel_size=1)
+            sd = torch.load(pathlib.Path(seg_checkpoint), map_location="cpu", weights_only=False)
+            if isinstance(sd, dict):
+                for key in ("state_dict", "model", "head"):
+                    if key in sd and isinstance(sd[key], dict):
+                        sd = sd[key]
+                        break
+                # accept either {'weight','bias'} or prefixed keys
+                w = sd.get("weight", sd.get("conv_seg.weight"))
+                b = sd.get("bias", sd.get("conv_seg.bias"))
+                if w is not None:
+                    head.weight.data.copy_(w.reshape(head.weight.shape))
+                if b is not None:
+                    head.bias.data.copy_(b.reshape(head.bias.shape))
+            self.seg_head = head
+            self.dim_out = num_classes
+        else:
+            _logger.warning(
+                "SemanticDINOv2Encoder: no seg_checkpoint provided; emitting DINOv2 backbone features "
+                "(equivalent to DINOv2Encoder). Provide seg_checkpoint to emit semantic class logits."
+            )
+            self.dim_out = embed_dim
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """(..., 3 or 1, H, W) -> (..., dim_out, H', W') where dim_out is num_classes (seg) or embed_dim."""
+        leading_dims = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.view(-1, c, h, w)
+        if c == 1:
+            images = images.expand(-1, 3, -1, -1)
+        images = images[
+            ...,
+            : self.subsample_factor * (h // self.subsample_factor),
+            : self.subsample_factor * (w // self.subsample_factor),
+        ]
+        hp, wp = h // self.subsample_factor, w // self.subsample_factor
+        tokens = self.dinov2.forward_features(images)["x_norm_patchtokens"]  # type: ignore
+        feats = tokens.permute(0, 2, 1).reshape(images.shape[0], -1, hp, wp)
+        if self.seg_head is not None:
+            feats = self.seg_head(feats)  # [B, num_classes, hp, wp]
+        return feats.reshape(*leading_dims, feats.shape[1], hp, wp)
+
+
+class CLIPEncoder(Encoder):
+    """OpenAI CLIP ViT-L/14 dense patch-token encoder (patch14 / 1024-d).
+
+    CLIP ViT-L/14 is patch size 14 with hidden width 1024 -- the SAME grid and dim as DINOv2 ViT-L/14
+    -- so it is directly ``ListMultiEncoder``-compatible with a DINOv2-L expert (no resampling needed).
+    It contributes language-aligned appearance features that are complementary to DINOv2's
+    self-supervised features and carry no relative-depth bias.
+
+    Requires the ``transformers`` package and the ``openai/clip-vit-large-patch14`` weights
+    (downloaded/cached on first use). The per-patch hidden states are taken from
+    ``CLIPVisionModel(...).last_hidden_state`` with the leading CLS token dropped.
+
+    Caveats:
+      * Resolution: CLIP's positional embeddings are trained at 224x224; ``interpolate_pos_encoding``
+        is enabled so arbitrary (patch-multiple) sizes work, at some accuracy cost vs native 224.
+      * Normalization: like ``DINOv2Encoder`` this does NOT renormalize inputs by default (CLIP's
+        mean/std differ slightly from ImageNet's). Set ``normalize=True`` to apply CLIP statistics if
+        your pipeline feeds raw [0, 1] images.
+    """
+
+    supports_rgb = True
+    _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+    def __init__(self, model_name: str = "openai/clip-vit-large-patch14", normalize: bool = False) -> None:
+        """Initialize the CLIP encoder.
+
+        Args:
+            model_name: HF model id (or local path) for a CLIP vision model (ViT-L/14 -> patch14/1024).
+            normalize: If True, apply CLIP mean/std to inputs (use when the pipeline feeds raw [0,1]).
+        """
+        super(CLIPEncoder, self).__init__()
+        try:
+            from transformers import CLIPVisionModel  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise ImportError(
+                "CLIPEncoder requires the 'transformers' package (pip install transformers) and the "
+                "'openai/clip-vit-large-patch14' weights."
+            ) from exc
+
+        self.model = CLIPVisionModel.from_pretrained(model_name)
+        self.model.eval()
+        vc = self.model.config
+        self.subsample_factor = int(vc.patch_size)  # 14 for ViT-L/14
+        self.dim_out = int(vc.hidden_size)  # 1024 for ViT-L/14
+        self.normalize = normalize
+        if normalize:
+            self.register_buffer("_mean", torch.tensor(self._CLIP_MEAN).view(1, 3, 1, 1))
+            self.register_buffer("_std", torch.tensor(self._CLIP_STD).view(1, 3, 1, 1))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """(..., 3 or 1, H, W) -> (..., 1024, H', W') CLIP patch tokens at patch14."""
+        leading_dims = images.shape[:-3]
+        c, h, w = images.shape[-3:]
+        images = images.view(-1, c, h, w)
+        if c == 1:
+            images = images.expand(-1, 3, -1, -1)
+        h = self.subsample_factor * (h // self.subsample_factor)
+        w = self.subsample_factor * (w // self.subsample_factor)
+        images = images[..., :h, :w]
+        if self.normalize:
+            images = (images - self._mean) / self._std
+        hp, wp = h // self.subsample_factor, w // self.subsample_factor
+        out = self.model(pixel_values=images, interpolate_pos_encoding=True)
+        tokens = out.last_hidden_state[:, 1:, :]  # drop CLS -> [B, hp*wp, 1024]
+        feats = tokens.permute(0, 2, 1).reshape(images.shape[0], -1, hp, wp)
+        return feats.reshape(*leading_dims, feats.shape[1], hp, wp)
 
 
 class DPTv2Encoder(Encoder):

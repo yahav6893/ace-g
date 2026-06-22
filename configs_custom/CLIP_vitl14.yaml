@@ -1,0 +1,36 @@
+sst:
+  output_dir: ~/dace/outputs
+  num_iterations: 25000
+  train_head: true
+
+  # Single SCR head on CLIP ViT-L/14 patch features (patch14 / 1024-d).
+  # dim_in auto-derives from encoder.dim_out (1024).
+  head:
+    obj_type: ace_g.scr_heads.MLPHead
+    num_blocks: 1
+    use_homogeneous: true
+    homogeneous_min_scale: 0.01
+    homogeneous_max_scale: 4.0
+    use_uncertainty: false
+
+  encoder:
+    obj_type: ace_g.encoders.CLIPEncoder
+    kwargs:
+      # Requires `pip install transformers` + the openai/clip-vit-large-patch14 weights (cached on first use).
+      model_name: openai/clip-vit-large-patch14
+      normalize: false   # set true only if the pipeline feeds raw [0,1] images
+    path: null
+
+  max_buffer_size: 4_000_000
+  schedule_config:
+    learning_rate_min: 5.0e-05
+    learning_rate_max: 0.0005
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true
+_note: 'Single-expert CLIP ViT-L/14 baseline. patch14/1024 -> fusion-compatible with DINOv2-L.
+  Train this to produce a CLIP head.pt, then place it at outputs/heads/ for the frozen fusion config
+  MoGU_N2_dinov2L_clip.yaml. Requires transformers + CLIP weights.'

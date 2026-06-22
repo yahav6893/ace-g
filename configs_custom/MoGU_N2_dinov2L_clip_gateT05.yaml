@@ -1,14 +1,16 @@
 sst:
   output_dir: ~/dace/outputs
-  num_iterations: 5000
+  num_iterations: 25000
   train_head: true
   head:
     obj_type: ace_g.scr_heads.UncExpertFusionHead
     dim_in: 2048
     num_experts: 2
+    # Frozen pretrained experts (mirror tau0_scalar_unc). Order MUST match the encoder list:
+    #   expert0 <- DINOv2-L (first 1024 channels), expert1 <- CLIP-L/14 (next 1024 channels).
     expert_head_paths:
     - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
-    - /home/eng/vinokuy2/dace/outputs/heads/dptv2_vitl-aceg_cambridge-shopfacade_head.pt
+    - /home/eng/vinokuy2/dace/outputs/heads/CLIP_vitl14-aceg_cambridge-shopfacade_head.pt
     freeze_loaded_experts: true
     force_shared_mean: false
     expert_head:
@@ -22,7 +24,6 @@ sst:
     mogu_loss_weight: 0.0
     var_min: 0.1
     var_max: 100.0
-    # Inverse-variance gate temperature: 1.0 = standard; <1.0 sharpens toward hard top-1; >1.0 softens.
     gate_temperature: 0.5
     tau_source: total
     tau_detach: true
@@ -51,10 +52,10 @@ sst:
         kwargs:
           model_name: dinov2_vitl14_reg
         path: null
-      - obj_type: ace_g.encoders.DPTv2Encoder
+      - obj_type: ace_g.encoders.CLIPEncoder
         kwargs:
-          model_name: vitl
-          checkpoint: /home/eng/vinokuy2/dace/cache/depth_anything/depth_anything_v2_vitl.pth
+          model_name: openai/clip-vit-large-patch14
+          normalize: false
         path: null
     path: null
   max_buffer_size: 4000000
@@ -67,5 +68,7 @@ sst:
   feature_aug_drop: 0.1
   feature_aug_std: 0.0
   use_half: true
-_note: 'Primary candidate: frozen experts, no shared-mean overwrite, total uncertainty
-  as tau, no auxiliary MoGU loss.'
+_note: 'gate_temperature=0.5 sanity variant of MoGU_N2_dinov2L_clip (sharper inverse-variance gate,
+  toward hard top-1 routing). Trained at T=0.5 (not just eval-time) to check whether sharper routing
+  suppresses the weak CLIP expert and recovers ~DINOv2-alone pose. Compare to T=1.0 baseline
+  (fused 6.68cm vs DINOv2 5.78cm). Analyze with register_eval_expert_modes.py / analyze_fusion.py.'

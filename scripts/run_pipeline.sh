@@ -4,7 +4,10 @@ set -euo pipefail
 # Default configuration parameters (overrideable via environment variables)
 REPO_ROOT="${REPO_ROOT:-${HOME}/dace/ace-g}"
 DATASET_ROOT="${DATASET_ROOT:-${HOME}/dace/datasets/cambridge}"
-CONFIG_NAME="${CONFIG_NAME:-MoGU_N2_frozen_total_tau0_scalar_unc.yaml}"
+# Default config. FiT3D single-expert baseline (low depth bias, candidate 2nd expert).
+# Override with CONFIG_NAME=... ; the previous MoGU default is kept below for convenience.
+CONFIG_NAME="${CONFIG_NAME:-MoGU_N2_dinov2L_clip.yaml}"
+# CONFIG_NAME="${CONFIG_NAME:-MoGU_N2_frozen_total_tau0_scalar_unc.yaml}"
 #SCENES="${SCENES:-shopfacade kingscollege oldhospital stmaryschurch greatcourt}"
 SCENES="${SCENES:-shopfacade}"
 

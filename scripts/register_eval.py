@@ -185,9 +185,14 @@ def main() -> int:
             continue
 
         session_id = st["session_id"]
+        # register_images appends the registration mode (default "fused", via
+        # append_registration_mode_to_session_id=True) to the session id, so its
+        # outputs are named "<session>_fused_*". Mirror that suffix here, otherwise
+        # the reg_yaml.is_file() guard below never passes and eval is silently skipped.
+        reg_session_id = f"{session_id}_fused"
         scene_test = scene_split_paths(dataset_root, scene, "test")
         map_yaml = expand(st["map_yaml"])
-        reg_yaml = output_dirs["root"] / f"{session_id}_reg.yaml"
+        reg_yaml = output_dirs["root"] / f"{reg_session_id}_reg.yaml"
 
         reg_result = None
         reg_log = output_dirs["logs"] / f"{session_id}__register.log"
@@ -235,7 +240,10 @@ def main() -> int:
             if not args.dry_run and not reg_yaml.is_file():
                 raise ScriptError(f"--skip-register was given, but reg yaml is missing: {reg_yaml}")
 
-        eval_yaml = output_dirs["root"] / f"{session_id}_eval.yaml"
+        # eval_poses derives its session id from the *_fused_registered_poses.txt stem
+        # and writes into --output_dir (metrics_dir), so the eval yaml is
+        # "<session>_fused_eval.yaml" under metrics_dir, not "<session>_eval.yaml" under root.
+        eval_yaml = metrics_dir / f"{reg_session_id}_eval.yaml"
         cmd_eval = [
             sys.executable,
             "-m",

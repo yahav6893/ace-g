@@ -1,0 +1,87 @@
+sst:
+  output_dir: ~/dace/outputs
+  num_iterations: 25000
+  train_head: true
+  head:
+    obj_type: ace_g.scr_heads.UncExpertFusionHead
+    # Heterogeneous experts: DINOv2-L (1024) + FiT3D-B (768). dim_in = sum(expert_dims).
+    dim_in: 1792
+    num_experts: 2
+    # Per-expert input dims, in encoder order. Drives the uneven channel split:
+    #   expert0 <- channels [0:1024]   (DINOv2-L)
+    #   expert1 <- channels [1024:1792] (FiT3D-B)
+    expert_dims: [1024, 768]
+    # Frozen pretrained experts. Order MUST match the encoder list and expert_dims.
+    # expert1 requires a FiT3D-B single-expert head: train FiT3D_dinov2.yaml first, then promote
+    # its head.pt to the path below (see _note).
+    expert_head_paths:
+    - /home/eng/vinokuy2/dace/outputs/heads/DINOv2_vitl_reg-aceg_cambridge-shopfacade_head.pt
+    - /home/eng/vinokuy2/dace/outputs/heads/FiT3D_dinov2_base-aceg_cambridge-shopfacade_head.pt
+    freeze_loaded_experts: true
+    force_shared_mean: false
+    # expert_head is a TEMPLATE; its dim_in is overridden per-expert from expert_dims at build time.
+    expert_head:
+      obj_type: ace_g.scr_heads.MLPHead
+      dim_in: 1024
+      num_blocks: 1
+      use_homogeneous: true
+      homogeneous_min_scale: 0.01
+      homogeneous_max_scale: 4.0
+      use_uncertainty: false
+    mogu_loss_weight: 0.0
+    var_min: 0.1
+    var_max: 100.0
+    gate_temperature: 1.0
+    tau_source: total
+    tau_detach: true
+    tau_min_px: 1.0
+    tau_max_px: 100.0
+    # unc_head is also a TEMPLATE; dim_in is overridden per-expert from expert_dims at build time.
+    unc_head:
+      dim_in: 1024
+      out_dim: 1
+      arc_type: mlp
+      hidden_ratio: 1.0
+      head_dropout: 0.0
+      var_eps: 1.0e-06
+    eps: 1.0e-08
+    return_fused_uncertainty: false
+    expert_learning_rate_min: 1.0e-07
+    expert_learning_rate_max: 5.0e-06
+    unc_learning_rate_min: 1.0e-05
+    unc_learning_rate_max: 0.0005
+    unfreeze_experts_after_iterations: -1
+  repro_loss_soft_clamp_min: 5
+  encoder:
+    obj_type: ace_g.encoders.ListMultiEncoder
+    kwargs:
+      # Heterogeneous dims (1024 + 768) require allow_uneven_dims; both are patch14 so the
+      # spatial grid matches and channel-concat is valid.
+      allow_uneven_dims: true
+      encoders:
+      - obj_type: ace_g.encoders.DINOv2Encoder
+        kwargs:
+          model_name: dinov2_vitl14_reg
+        path: null
+      - obj_type: ace_g.encoders.FiT3DEncoder
+        kwargs:
+          model_name: dinov2_base_fine
+          repo: ywyue/FiT3D
+        path: null
+    path: null
+  max_buffer_size: 4000000
+  schedule_config:
+    learning_rate_min: 5.0e-05
+    learning_rate_max: 0.0005
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true
+_note: 'DINOv2-L (1024) + FiT3D-B (768) heterogeneous frozen MoGU fusion. Mirrors
+  MoGU_N2_dinov2L_clip.yaml but expert1 = FiT3D-B (3D-aware, low depth bias). Requires a trained
+  FiT3D-B single-expert head at expert_head_paths[1]: run FiT3D_dinov2.yaml (25k) first and promote
+  its head.pt to outputs/heads/FiT3D_dinov2_base-aceg_cambridge-shopfacade_head.pt. Pre-screen a
+  cold head with scripts/diagnose_heads_unc.py repro-vs-pose before the full 25k run; analyze with
+  analyze_fusion.py. Bar to beat: single DINOv2-L = 6.18 cm on shopfacade.'

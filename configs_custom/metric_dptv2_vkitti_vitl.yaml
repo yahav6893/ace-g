@@ -1,0 +1,44 @@
+sst:
+  output_dir: ~/dace/outputs
+  num_iterations: 25000
+  train_head: true
+
+  # Single SCR head on the METRIC Depth-Anything-V2 (VKITTI, outdoor) DINOv2-L backbone.
+  # Hypothesis: a backbone fine-tuned for *absolute metric* depth lacks the compressed/biased
+  # relative-depth structure that made the relative-DPT expert reproject well but pose badly.
+  # dim_in = 1024 (patch14) -> fusion-compatible with DINOv2-L.
+  head:
+    obj_type: ace_g.scr_heads.MLPHead
+    dim_in: 1024
+    num_blocks: 1
+    use_homogeneous: true
+    homogeneous_min_scale: 0.01
+    homogeneous_max_scale: 4.0
+    use_uncertainty: false
+
+  encoder:
+    obj_type: ace_g.encoders.DPTv2Encoder
+    kwargs:
+      model_name: vitl
+      # Metric DA-V2 Large, VKITTI (outdoor, max-depth 80) -> Cambridge domain match.
+      # DPTv2Encoder loads only the 'pretrained.*' backbone (discards the depth head).
+      # No normalization applied (mirrors the relative dptv2_vitl.yaml pipeline) for a fair
+      # metric-vs-relative comparison.
+      checkpoint: /home/eng/vinokuy2/dace/cache/depth_anything/depth_anything_v2_metric_vkitti_vitl.pth
+    path: null
+
+  max_buffer_size: 4_000_000
+  schedule_config:
+    learning_rate_min: 5.0e-05
+    learning_rate_max: 0.0005
+    learning_rate_div_factor: 25
+    learning_rate_final_div_factor: 10000
+  use_feature_aug: true
+  feature_aug_drop: 0.1
+  feature_aug_std: 0.0
+  use_half: true
+_note: 'Single-expert METRIC Depth-Anything-V2 (VKITTI-Large) baseline. patch14/1024 -> drop-in fusion
+  partner for DINOv2-L. Train this to produce a head.pt, then place it at outputs/heads/ for a frozen
+  DINOv2-L + metric-DPT fusion. Directly tests whether absolute metric depth removes the compressed-depth
+  bias that sank the relative-DPT expert (relative-DPT: better reproj on 68% of images, better pose on
+  only 24%). Pre-screen its depth structure (std_z/spread) against relative-DPT + DINOv2 before fusing.'

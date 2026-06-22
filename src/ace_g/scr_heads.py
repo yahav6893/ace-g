@@ -976,6 +976,13 @@ class UncExpertFusionHead(SCRHead):
         expert_heads: list[MLPHead.Config] | None = None
         expert_head: MLPHead.Config | None = None
 
+        # Per-expert input feature dims, in encoder order (e.g. [1024, 768] for
+        # DINOv2-L + FiT3D-B). When set, the concatenated input (dim_in == sum(expert_dims))
+        # is split unevenly by channel slice instead of an even view-split, and each
+        # expert_head[i] / unc_head[i] is built with dim_in = expert_dims[i].
+        # When None, falls back to the even split (dim_in must be divisible by num_experts).
+        expert_dims: list[int] | None = None
+
         # Optional pretrained expert loading
         expert_head_paths: list[pathlib.Path | None] | None = None
         freeze_loaded_experts: bool = True
@@ -990,6 +997,12 @@ class UncExpertFusionHead(SCRHead):
         var_min: float = 1e-2
         var_max: float = 100.0
         mogu_loss_weight: float = 1.0
+
+        # Temperature for the inverse-variance gate. w_i = softmax(log(1/sigma_i^2) / T).
+        # T = 1.0 -> standard inverse-variance weighting (unchanged).
+        # T < 1.0 -> sharper, pushing toward hard top-1 expert selection (T -> 0 = argmin sigma).
+        # T > 1.0 -> softer / more uniform blending.
+        gate_temperature: float = 1.0
 
         # Optional uncertainty-derived tau for the existing ReproLoss dyntanh branch.
         # tau_source controls which uncertainty tensor is used as tau:
@@ -1029,11 +1042,32 @@ class UncExpertFusionHead(SCRHead):
 
         assert self.config.dim_in is not None, "dim_in must be set."
         assert self.config.num_experts >= 1
-        assert self.config.dim_in % self.config.num_experts == 0, (
-            "dim_in must be divisible by num_experts."
-        )
 
-        self.c = self.config.dim_in // self.config.num_experts
+        k_experts = self.config.num_experts
+        if self.config.expert_dims is not None:
+            assert len(self.config.expert_dims) == k_experts, (
+                f"expert_dims length ({len(self.config.expert_dims)}) must equal "
+                f"num_experts ({k_experts})."
+            )
+            assert sum(self.config.expert_dims) == self.config.dim_in, (
+                f"sum(expert_dims)={sum(self.config.expert_dims)} must equal "
+                f"dim_in={self.config.dim_in}."
+            )
+            self.expert_dims = list(self.config.expert_dims)
+        else:
+            assert self.config.dim_in % k_experts == 0, (
+                "dim_in must be divisible by num_experts (or set expert_dims for uneven split)."
+            )
+            self.expert_dims = [self.config.dim_in // k_experts] * k_experts
+
+        # Channel-slice boundaries into the concatenated feature tensor: expert i occupies
+        # channels [expert_offsets[i] : expert_offsets[i + 1]].
+        self.expert_offsets = [0]
+        for d in self.expert_dims:
+            self.expert_offsets.append(self.expert_offsets[-1] + d)
+
+        # Retained for backward compatibility / logging (== per-expert dim only when even).
+        self.c = self.expert_dims[0]
 
         super().__init__(
             mean=self.config.mean,
@@ -1068,8 +1102,8 @@ class UncExpertFusionHead(SCRHead):
                 )
 
             mlp_cfgs = [
-                dataclasses.replace(template, dim_in=self.c, use_uncertainty=False)
-                for _ in range(k)
+                dataclasses.replace(template, dim_in=self.expert_dims[i], use_uncertainty=False)
+                for i in range(k)
             ]
 
         # -------------------------------------------------
@@ -1094,8 +1128,8 @@ class UncExpertFusionHead(SCRHead):
                 )
 
             unc_cfgs = [
-                dataclasses.replace(template_unc, dim_in=self.c)
-                for _ in range(k)
+                dataclasses.replace(template_unc, dim_in=self.expert_dims[i])
+                for i in range(k)
             ]
 
         # -------------------------------------------------
@@ -1149,11 +1183,12 @@ class UncExpertFusionHead(SCRHead):
                     )
 
                 if getattr(loaded.config, "dim_in", None) is not None:
-                    if loaded.config.dim_in != self.c:
+                    if loaded.config.dim_in != self.expert_dims[i]:
                         raise ValueError(
                             f"Loaded expert[{i}] dim_in={loaded.config.dim_in}, "
-                            f"but expected {self.c} "
-                            f"(dim_in={self.config.dim_in}, num_experts={k})."
+                            f"but expected {self.expert_dims[i]} "
+                            f"(dim_in={self.config.dim_in}, num_experts={k}, "
+                            f"expert_dims={self.expert_dims})."
                         )
 
                 # Replace only the MLPHead.
@@ -1244,21 +1279,20 @@ class UncExpertFusionHead(SCRHead):
         b = x.shape[0]
 
         k = self.config.num_experts
-        c = self.c
 
-        if dim_in != k * c:
+        if dim_in != self.expert_offsets[-1]:
             raise ValueError(
-                f"UncExpertFusionHead: expected dim_in={k * c}, got {dim_in}"
+                f"UncExpertFusionHead: expected dim_in={self.expert_offsets[-1]} "
+                f"(expert_dims={self.expert_dims}), got {dim_in}"
             )
-
-        # Split expert features: [B, K, C, h, w]
-        feats = x.view(b, k, c, h, w)
 
         predictions = []
         sq_sigmas = []
 
         for i in range(k):
-            y_pred_i, sq_sigma_i = self.experts[i](feats[:, i])
+            # Channel-slice expert i's features (handles even and uneven dims): [B, dims_i, h, w]
+            feats_i = x[:, self.expert_offsets[i]:self.expert_offsets[i + 1]]
+            y_pred_i, sq_sigma_i = self.experts[i](feats_i)
 
             predictions.append(y_pred_i)
             sq_sigmas.append(sq_sigma_i)
@@ -1294,9 +1328,17 @@ class UncExpertFusionHead(SCRHead):
         )
         inv_var = 1.0 / (sigmas_safe.float() + eps)
 
-        # Normalize over expert dimension K. If sigmas has one channel, this is one
-        # scalar weight per expert/patch and broadcasts coherently over xyz.
-        weights = inv_var / inv_var.sum(dim=1, keepdim=True)
+        # Normalize over expert dimension K with a temperature on the inverse-variance gate.
+        # Done in log-space as a softmax for numerical stability:
+        #   T = 1.0 reproduces plain inverse-variance weighting (inv_var / sum_k inv_var);
+        #   T < 1.0 sharpens toward hard top-1 selection; T > 1.0 softens toward uniform.
+        # If sigmas has one channel, this is one scalar weight per expert/patch and
+        # broadcasts coherently over xyz.
+        gate_temperature = float(getattr(self.config, "gate_temperature", 1.0))
+        if gate_temperature <= 0.0:
+            raise ValueError(f"gate_temperature must be > 0, got {gate_temperature}")
+        gate_logits = torch.log(inv_var.clamp_min(eps)) / gate_temperature
+        weights = torch.softmax(gate_logits, dim=1)
         
         # SANITY CHECK: force a specific expert
         if self.config.sanity_check_force_expert is not None:
